@@ -4,7 +4,6 @@ import json
 import plotly.express as px
 import plotly.graph_objects as go
 import pandas as pd
-import pydeck as pdk
 from datetime import datetime, timedelta
 from google.analytics.data_v1beta import BetaAnalyticsDataClient
 from google.analytics.data_v1beta.types import (
@@ -27,6 +26,41 @@ def format_ga_date(d_str):
     if len(d_str) == 8:
         return f"{d_str[6:8]}.{d_str[4:6]}.{d_str[0:4]}"
     return d_str
+
+# Słownik flag i tłumaczeń państw
+COUNTRY_FLAGS = {
+    "poland": ("Polska", "🇵🇱"), "polska": ("Polska", "🇵🇱"),
+    "germany": ("Niemcy", "🇩🇪"), "niemcy": ("Niemcy", "🇩🇪"),
+    "united kingdom": ("Wielka Brytania", "🇬🇧"),
+    "united states": ("Stany Zjednoczone", "🇺🇸"), "usa": ("Stany Zjednoczone", "🇺🇸"),
+    "ukraine": ("Ukraina", "🇺🇦"), "ukraina": ("Ukraina", "🇺🇦"),
+    "france": ("Francja", "🇫🇷"), "francja": ("Francja", "🇫🇷"),
+    "netherlands": ("Holandia", "🇳🇱"), "holandia": ("Holandia", "🇳🇱"),
+    "norway": ("Norwegia", "🇳🇴"), "norwegia": ("Norwegia", "🇳🇴"),
+    "czechia": ("Czechy", "🇨🇿"), "czech republic": ("Czechy", "🇨🇿"),
+    "sweden": ("Szwecja", "🇸🇪"), "spain": ("Hiszpania", "🇪🇸"),
+    "italy": ("Włochy", "🇮🇹"), "denmark": ("Dania", "🇩🇰"),
+    "ireland": ("Irlandia", "🇮🇪"), "belgium": ("Belgia", "🇧🇪"),
+    "austria": ("Austria", "🇦🇹"), "switzerland": ("Szwajcaria", "🇨🇭"),
+    "slovakia": ("Słowacja", "🇸🇰"), "lithuania": ("Litwa", "🇱🇹"),
+    "finland": ("Finlandia", "🇫🇮"), "canada": ("Kanada", "🇨🇦"),
+}
+
+def get_country_info(raw_country):
+    if not raw_country or raw_country == "(not set)":
+        return "Polska", "🇵🇱"
+    c_low = raw_country.lower().strip()
+    if c_low in COUNTRY_FLAGS:
+        return COUNTRY_FLAGS[c_low]
+    return raw_country, "🌐"
+
+COUNTRY_DEFAULT_COORDS = {
+    "poland": (52.2297, 21.0122), "germany": (52.5200, 13.4050),
+    "united kingdom": (51.5074, -0.1278), "united states": (38.8951, -77.0364),
+    "ukraine": (50.4501, 30.5234), "france": (48.8566, 2.3522),
+    "netherlands": (52.3676, 4.9041), "norway": (59.9139, 10.7522),
+    "czechia": (50.0755, 14.4378), "sweden": (59.3293, 18.0686),
+}
 
 CHANNEL_TRANSLATION = {
     "Organic Search": "Google (Wyszukiwarka)",
@@ -145,7 +179,7 @@ def check_password():
 if not check_password():
     st.stop()
 
-# --- CLOUDFLARE Z PORÓWNANIEM POPRZEDNIEGO OKRESU ---
+# --- CLOUDFLARE Z PORÓWNANIEM ---
 @st.cache_data(ttl=300)
 def fetch_cloudflare_data(days=7):
     if "CF_API_TOKEN" not in st.secrets or "CF_ZONE_ID" not in st.secrets:
@@ -215,7 +249,6 @@ def fetch_cloudflare_data(days=7):
             "threats": f"{calc_delta(curr['threats'], prev['threats'])} (było: {prev['threats']:,})",
         }
         
-        # Przygotowanie danych do porównawczego wykresu liniowego
         comparison_daily = []
         max_len = max(len(curr_groups), len(prev_groups))
         for i in range(max_len):
@@ -237,7 +270,7 @@ def fetch_cloudflare_data(days=7):
     except Exception as e:
         return None, None, None, str(e)
 
-# --- GOOGLE ANALYTICS 4 Z PORÓWNANIEM ---
+# --- GOOGLE ANALYTICS 4 Z MIASTAMI, KRAJAMI I FLAGAMI ---
 @st.cache_data(ttl=300)
 def fetch_ga4_data(days=7):
     if "gcp_service_account" not in st.secrets or "GA4_PROPERTY_ID" not in st.secrets:
@@ -274,17 +307,18 @@ def fetch_ga4_data(days=7):
             "engagement_rate": f"{(curr_vals[3] - prev_vals[3])*100:+.1f} p.p. (było: {prev_vals[3]*100:.1f}%)" if prev_vals[3] else "",
         }
 
-        # 3. MIASTA + DATA + ŹRÓDŁO
+        # 3. MIASTA + KRAJ + DATA + ŹRÓDŁO
         cities_req = RunReportRequest(
             property=f"properties/{property_id}",
             dimensions=[
                 Dimension(name="city"),
+                Dimension(name="country"),
                 Dimension(name="date"),
                 Dimension(name="sessionDefaultChannelGroup"),
             ],
             metrics=[Metric(name="activeUsers"), Metric(name="sessions")],
             order_bys=[OrderBy(metric=OrderBy.MetricOrderBy(metric_name="activeUsers"), desc=True)],
-            limit=250,
+            limit=300,
             date_ranges=[DateRange(start_date=f"{days}daysAgo", end_date="today")],
         )
         cities_res = client.run_report(cities_req)
@@ -292,17 +326,27 @@ def fetch_ga4_data(days=7):
         city_groups = {}
         for r in cities_res.rows:
             city_name = r.dimension_values[0].value
+            country_raw = r.dimension_values[1].value
             if not city_name or city_name == "(not set)":
                 continue
-            date_str = r.dimension_values[1].value
-            channel = r.dimension_values[2].value
+            
+            date_str = r.dimension_values[2].value
+            channel = r.dimension_values[3].value
             users = int(r.metric_values[0].value)
             sess = int(r.metric_values[1].value)
             
-            if city_name not in city_groups:
+            country_name, flag = get_country_info(country_raw)
+            
+            city_key = f"{city_name}_{country_name}"
+            if city_key not in city_groups:
                 coords = CITY_COORDS.get(city_name.lower())
-                city_groups[city_name] = {
+                if not coords and country_raw.lower() in COUNTRY_DEFAULT_COORDS:
+                    coords = COUNTRY_DEFAULT_COORDS[country_raw.lower()]
+                
+                city_groups[city_key] = {
                     "Miasto": city_name,
+                    "Kraj": country_name,
+                    "Flaga": flag,
                     "Użytkownicy": 0,
                     "Sesje": 0,
                     "latest_date": date_str,
@@ -311,25 +355,34 @@ def fetch_ga4_data(days=7):
                     "longitude": coords[1] if coords else None,
                 }
             
-            city_groups[city_name]["Użytkownicy"] += users
-            city_groups[city_name]["Sesje"] += sess
-            if date_str > city_groups[city_name]["latest_date"]:
-                city_groups[city_name]["latest_date"] = date_str
-            city_groups[city_name]["channels"][channel] = city_groups[city_name]["channels"].get(channel, 0) + sess
+            city_groups[city_key]["Użytkownicy"] += users
+            city_groups[city_key]["Sesje"] += sess
+            if date_str > city_groups[city_key]["latest_date"]:
+                city_groups[city_key]["latest_date"] = date_str
+            city_groups[city_key]["channels"][channel] = city_groups[city_key]["channels"].get(channel, 0) + sess
 
         cities = []
-        for cname, cdata in city_groups.items():
+        for ckey, cdata in city_groups.items():
             top_channel_raw = max(cdata["channels"], key=cdata["channels"].get) if cdata["channels"] else "Inne"
             top_channel = CHANNEL_TRANSLATION.get(top_channel_raw, top_channel_raw)
-            promien = 12000 + min(cdata["Użytkownicy"] * 2500, 45000)
+            formatted_date = format_ga_date(cdata["latest_date"])
+            
+            hover_html = (
+                f"<b>📍 {cdata['Miasto']}, {cdata['Kraj']} {cdata['Flaga']}</b><br><br>"
+                f"👥 <b>Odwiedzający:</b> {cdata['Użytkownicy']} osób<br>"
+                f"🔄 <b>Liczba wizyt:</b> {cdata['Sesje']} sesji<br>"
+                f"📅 <b>Ostatnia wizyta:</b> {formatted_date}<br>"
+                f"🎯 <b>Główne źródło:</b> {top_channel}"
+            )
             
             cities.append({
                 "Miasto": cdata["Miasto"],
+                "Kraj": f"{cdata['Kraj']} {cdata['Flaga']}",
                 "Użytkownicy": cdata["Użytkownicy"],
                 "Sesje": cdata["Sesje"],
-                "Kiedy": format_ga_date(cdata["latest_date"]),
+                "Kiedy": formatted_date,
                 "Zrodlo": top_channel,
-                "promien": promien,
+                "hover_text": hover_html,
                 "latitude": cdata["latitude"],
                 "longitude": cdata["longitude"],
             })
@@ -402,13 +455,12 @@ elif cf_data:
     cf3.metric("Transfer", f"{cf_data['bandwidth_mb']} MB", delta=cf_deltas.get("bandwidth"))
     cf4.metric("Zablokowane ataki", cf_data["threats"], delta=cf_deltas.get("threats"), delta_color="inverse")
     
-    # --- WYKRES LINIOWY: PORÓWNANIE BIEŻĄCY VS POPRZEDNI OKRES ---
+    # --- WYKRES LINIOWY: PORÓWNANIE RUCHU BIEŻĄCY VS POPRZEDNI OKRES ---
     if cf_comparison and len(cf_comparison) > 1:
         st.markdown("#### 📈 Porównanie ruchu dzień po dniu (Bieżący vs Poprzedni okres)")
         
         fig_line = go.Figure()
         
-        # Linia 1: Bieżący okres
         fig_line.add_trace(go.Scatter(
             x=[d["Dzień"] for d in cf_comparison],
             y=[d["Bieżący okres"] for d in cf_comparison],
@@ -420,7 +472,6 @@ elif cf_data:
             hovertemplate="<b>Bieżący: %{y}</b> (%{customdata})<extra></extra>"
         ))
         
-        # Linia 2: Poprzedni okres
         fig_line.add_trace(go.Scatter(
             x=[d["Dzień"] for d in cf_comparison],
             y=[d["Poprzedni okres"] for d in cf_comparison],
@@ -444,61 +495,49 @@ elif cf_data:
         )
         st.plotly_chart(fig_line, use_container_width=True)
 
-# --- MAPA Z DYMKAMI (PYDECK) ---
+# --- INTERAKTYWNA MAPA Z DYMKAMI (MIASTO + KRAJ + FLAGA) ---
 st.markdown("---")
-st.markdown("### 🗺️ Skąd wchodzą goście? (Dotknij lub najedź na punkt)")
+st.markdown("### 🗺️ Skąd wchodzą goście? (Najedź kursorem lub dotknij punktu)")
 
 if ga_cities:
     df_all_cities = pd.DataFrame(ga_cities)
     df_map = df_all_cities.dropna(subset=["latitude", "longitude"])
     
     if not df_map.empty:
-        layer = pdk.Layer(
-            "ScatterplotLayer",
-            data=df_map,
-            get_position="[longitude, latitude]",
-            get_color="[249, 115, 22, 190]",
-            get_radius="promien",
-            pickable=True,
-            auto_highlight=True,
+        sizes = [max(13, min(int(u * 2.2), 36)) for u in df_map["Użytkownicy"]]
+        
+        fig_map = go.Figure(go.Scattermapbox(
+            lat=df_map["latitude"],
+            lon=df_map["longitude"],
+            mode="markers",
+            marker=go.scattermapbox.Marker(
+                size=sizes,
+                color="#f97316",
+                opacity=0.88,
+            ),
+            text=df_map["hover_text"],
+            hoverinfo="text",
+            hoverlabel=dict(
+                bgcolor="#0f172a",
+                bordercolor="#f97316",
+                font=dict(color="#f8fafc", size=13, family="sans-serif")
+            )
+        ))
+        
+        fig_map.update_layout(
+            mapbox=dict(
+                style="carto-darkmatter",
+                center=dict(lat=52.1, lon=19.4),
+                zoom=5.3,
+            ),
+            margin=dict(l=0, r=0, t=0, b=0),
+            height=380,
+            paper_bgcolor="rgba(0,0,0,0)",
         )
-
-        view_state = pdk.ViewState(
-            latitude=52.1,
-            longitude=19.4,
-            zoom=5.3,
-            pitch=0,
-        )
-
-        deck = pdk.Deck(
-            layers=[layer],
-            initial_view_state=view_state,
-            map_provider="carto",
-            map_style="dark",
-            tooltip={
-                "html": """
-                <div style="font-family: sans-serif; font-size: 13px; line-height: 1.5;">
-                    <div style="font-weight: 800; color: #f97316; font-size: 15px; margin-bottom: 4px;">📍 {Miasto}</div>
-                    <div>👥 <b>Odwiedzający:</b> {Użytkownicy} osób</div>
-                    <div>🔄 <b>Liczba wizyt:</b> {Sesje} sesji</div>
-                    <div>📅 <b>Ostatnia wizyta:</b> {Kiedy}</div>
-                    <div>🎯 <b>Główne źródło:</b> {Zrodlo}</div>
-                </div>
-                """,
-                "style": {
-                    "backgroundColor": "#0f172a",
-                    "color": "#f8fafc",
-                    "border": "1px solid #f97316",
-                    "borderRadius": "8px",
-                    "padding": "10px",
-                    "zIndex": "1000",
-                }
-            }
-        )
-        st.pydeck_chart(deck, use_container_width=True)
+        st.plotly_chart(fig_map, use_container_width=True)
     
     st.markdown("#### 🏆 Szczegółowy ranking miast")
-    st.dataframe(df_all_cities[["Miasto", "Użytkownicy", "Sesje", "Zrodlo", "Kiedy"]], hide_index=True, use_container_width=True)
+    st.dataframe(df_all_cities[["Miasto", "Kraj", "Użytkownicy", "Sesje", "Zrodlo", "Kiedy"]], hide_index=True, use_container_width=True)
 
 # --- ŹRÓDŁA I URZĄDZENIA ---
 st.markdown("---")
