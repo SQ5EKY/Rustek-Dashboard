@@ -15,13 +15,26 @@ from google.oauth2 import service_account
 
 # --- KONFIGURACJA STRONY ---
 st.set_page_config(
-    page_title="Rustec Analytics",
-    page_icon="📊",
+    page_title="RUSTEC™ Analytics",
+    page_icon="https://rustec.pl/assets/logo-sygnet.png",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
 
-# --- SYSTEM LOGOWANIA (PIN / HASŁO) ---
+# Stylizacja
+st.markdown("""
+<style>
+    .block-container { padding-top: 1.5rem; padding-bottom: 2rem; }
+    div[data-testid="metric-container"] {
+        background-color: #0f172a;
+        border: 1px solid #1e293b;
+        padding: 1rem;
+        border-radius: 0.75rem;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# --- SYSTEM LOGOWANIA Z LOGO RUSTEC ---
 def check_password():
     if "authenticated" not in st.session_state:
         st.session_state["authenticated"] = False
@@ -29,8 +42,12 @@ def check_password():
     if st.session_state["authenticated"]:
         return True
 
-    st.markdown("<h2 style='text-align: center; color: #f97316;'>🔒 Rustec Analytics</h2>", unsafe_allow_html=True)
-    st.markdown("<p style='text-align: center; color: #94a3b8;'>Panel prywatny</p>", unsafe_allow_html=True)
+    st.markdown("""
+    <div style="text-align: center; margin-top: 2rem; margin-bottom: 1.5rem;">
+        <img src="https://rustec.pl/assets/logo-black.png" alt="RUSTEC" style="max-width: 280px; width: 85%; height: auto; border-radius: 10px;">
+        <p style="color: #94a3b8; font-size: 0.95rem; margin-top: 10px; font-weight: 500;">Prywatny Panel Analityczny</p>
+    </div>
+    """, unsafe_allow_html=True)
     
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
@@ -48,17 +65,23 @@ if not check_password():
     st.stop()
 
 # --- POBIERANIE DANYCH Z CLOUDFLARE ---
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=300)
 def fetch_cloudflare_data(since_minutes=10080):
+    if "CF_API_TOKEN" not in st.secrets or "CF_ZONE_ID" not in st.secrets:
+        return None, "Brak klucza CF_API_TOKEN lub CF_ZONE_ID w Streamlit Secrets"
+    
+    token = st.secrets["CF_API_TOKEN"].strip()
+    zone_id = st.secrets["CF_ZONE_ID"].strip()
+    
+    url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/analytics/dashboard?since=-{since_minutes}"
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    
     try:
-        token = st.secrets["CF_API_TOKEN"]
-        zone_id = st.secrets["CF_ZONE_ID"]
-        url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/analytics/dashboard?since=-{since_minutes}"
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-        
         res = requests.get(url, headers=headers, timeout=10).json()
         if not res.get("success"):
-            return None, "Błąd Cloudflare API"
+            errors = res.get("errors", [])
+            err_msg = ", ".join([f"{e.get('code')}: {e.get('message')}" for e in errors]) if errors else "Odrzucono zapytanie"
+            return None, f"Cloudflare API: {err_msg}"
         
         totals = res["result"]["totals"]
         return {
@@ -71,13 +94,16 @@ def fetch_cloudflare_data(since_minutes=10080):
         return None, str(e)
 
 # --- POBIERANIE DANYCH Z GOOGLE ANALYTICS 4 ---
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=300)
 def fetch_ga4_data(days=7):
+    if "gcp_service_account" not in st.secrets or "GA4_PROPERTY_ID" not in st.secrets:
+        return None, None, None, "Brak poświadczeń GA4 w Secrets (podłączymy w kolejnym kroku)"
+    
     try:
         sa_info = dict(st.secrets["gcp_service_account"])
         credentials = service_account.Credentials.from_service_account_info(sa_info)
         client = BetaAnalyticsDataClient(credentials=credentials)
-        property_id = st.secrets["GA4_PROPERTY_ID"]
+        property_id = str(st.secrets["GA4_PROPERTY_ID"]).strip()
 
         metrics_req = RunReportRequest(
             property=f"properties/{property_id}",
@@ -132,11 +158,19 @@ def fetch_ga4_data(days=7):
     except Exception as e:
         return None, None, None, str(e)
 
-# --- WIDOK DASHBOARDU ---
-col_head, col_filter = st.columns([2, 1])
+# --- NAGŁÓWEK DASHBOARDU Z LOGO RUSTEC ---
+col_head, col_filter = st.columns([3, 1])
 with col_head:
-    st.markdown("<h1 style='margin: 0; padding: 0; color: #f97316;'>⚡ Rustec Stats</h1>", unsafe_allow_html=True)
-    st.caption(f"Ostatnia aktualizacja: {datetime.now().strftime('%H:%M:%S')}")
+    st.markdown("""
+    <div style="display: flex; align-items: center; gap: 14px; margin-bottom: 8px;">
+        <img src="https://rustec.pl/assets/logo-black.png" alt="RUSTEC" style="height: 44px; border-radius: 6px;">
+        <div style="border-left: 2px solid #f97316; padding-left: 12px;">
+            <div style="font-weight: 700; font-size: 1.25rem; color: #f8fafc; line-height: 1.2;">Live Analytics</div>
+            <div style="font-size: 0.78rem; color: #94a3b8;">Cloudflare & Google Analytics 4</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+    st.caption(f"Synchronizacja: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 with col_filter:
     period = st.selectbox("Zakres czasu", ["Ostatnie 24 godziny", "Ostatnie 7 dni", "Ostatnie 30 dni"], index=1)
@@ -147,19 +181,10 @@ with col_filter:
 cf_data, cf_err = fetch_cloudflare_data(since_minutes)
 ga_summary, ga_sources, ga_devices, ga_err = fetch_ga4_data(days)
 
-st.markdown("### 👥 Google Analytics 4")
-if ga_err:
-    st.error(f"Błąd GA4: {ga_err}")
-elif ga_summary:
-    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-    kpi1.metric("Użytkownicy", ga_summary["active_users"])
-    kpi2.metric("Sesje", ga_summary["sessions"])
-    kpi3.metric("Wyświetlenia stron", ga_summary["pageviews"])
-    kpi4.metric("Zaangażowanie", ga_summary["engagement_rate"], help=f"Śr. czas: {ga_summary['avg_duration']}")
-
+# --- SEKCJA CLOUDFLARE ---
 st.markdown("### 🛡️ Cloudflare")
 if cf_err:
-    st.error(f"Błąd Cloudflare: {cf_err}")
+    st.error(f"⚠️ {cf_err}")
 elif cf_data:
     cf1, cf2, cf3, cf4 = st.columns(4)
     cf1.metric("Unikalne IP", cf_data["uniques"])
@@ -167,6 +192,18 @@ elif cf_data:
     cf3.metric("Transfer", f"{cf_data['bandwidth_mb']} MB")
     cf4.metric("Zablokowane ataki", cf_data["threats"], delta_color="inverse")
 
+# --- SEKCJA GOOGLE ANALYTICS 4 ---
+st.markdown("### 👥 Google Analytics 4")
+if ga_err:
+    st.info(f"ℹ️ {ga_err}")
+elif ga_summary:
+    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+    kpi1.metric("Użytkownicy", ga_summary["active_users"])
+    kpi2.metric("Sesje", ga_summary["sessions"])
+    kpi3.metric("Wyświetlenia stron", ga_summary["pageviews"])
+    kpi4.metric("Zaangażowanie", ga_summary["engagement_rate"], help=f"Śr. czas: {ga_summary['avg_duration']}")
+
+# --- WYKRESY ---
 st.markdown("---")
 chart_col1, chart_col2 = st.columns(2)
 
@@ -175,16 +212,20 @@ with chart_col1:
     if ga_sources:
         df_sources = pd.DataFrame(ga_sources)
         fig1 = px.pie(df_sources, values="Sesje", names="Kanał", hole=0.45, color_discrete_sequence=px.colors.qualitative.Prism)
-        fig1.update_layout(margin=dict(t=10, b=10, l=10, r=10), showlegend=True)
+        fig1.update_layout(margin=dict(t=10, b=10, l=10, r=10), showlegend=True, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
         st.plotly_chart(fig1, use_container_width=True)
+    else:
+        st.caption("Wykres pojawi się po podłączeniu GA4.")
 
 with chart_col2:
     st.markdown("#### 📱 Urządzenia")
     if ga_devices:
         df_devices = pd.DataFrame(ga_devices)
         fig2 = px.bar(df_devices, x="Urządzenie", y="Sesje", color="Urządzenie", color_discrete_sequence=px.colors.qualitative.Safe)
-        fig2.update_layout(margin=dict(t=10, b=10, l=10, r=10), showlegend=False)
+        fig2.update_layout(margin=dict(t=10, b=10, l=10, r=10), showlegend=False, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
         st.plotly_chart(fig2, use_container_width=True)
+    else:
+        st.caption("Wykres pojawi się po podłączeniu GA4.")
 
 if st.button("Wyloguj"):
     st.session_state["authenticated"] = False
