@@ -3,7 +3,7 @@ import requests
 import json
 import plotly.express as px
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 from google.analytics.data_v1beta import BetaAnalyticsDataClient
 from google.analytics.data_v1beta.types import (
     DateRange,
@@ -64,34 +64,105 @@ def check_password():
 if not check_password():
     st.stop()
 
-# --- POBIERANIE DANYCH Z CLOUDFLARE ---
+# --- POBIERANIE DANYCH Z CLOUDFLARE (GraphQL API) ---
 @st.cache_data(ttl=300)
-def fetch_cloudflare_data(since_minutes=10080):
+def fetch_cloudflare_data(days=7):
     if "CF_API_TOKEN" not in st.secrets or "CF_ZONE_ID" not in st.secrets:
-        return None, "Brak klucza CF_API_TOKEN lub CF_ZONE_ID w Streamlit Secrets"
+        return None, None, "Brak klucza CF_API_TOKEN lub CF_ZONE_ID w Streamlit Secrets"
     
     token = st.secrets["CF_API_TOKEN"].strip()
     zone_id = st.secrets["CF_ZONE_ID"].strip()
     
-    url = f"https://api.cloudflare.com/client/v4/zones/{zone_id}/analytics/dashboard?since=-{since_minutes}"
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    now = datetime.utcnow()
+    start_date = (now - timedelta(days=days)).strftime("%Y-%m-%d")
+    end_date = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+    
+    query = """
+    query CloudflareDailyMetrics($zoneTag: String!, $startDate: Date!, $endDate: Date!) {
+      viewer {
+        zones(filter: { zoneTag: $zoneTag }) {
+          httpRequests1dGroups(
+            limit: 100
+            filter: { date_geq: $startDate, date_lt: $endDate }
+            orderBy: [date_ASC]
+          ) {
+            dimensions {
+              date
+            }
+            sum {
+              requests
+              pageViews
+              threats
+              bytes
+            }
+            uniq {
+              uniques
+            }
+          }
+        }
+      }
+    }
+    """
+    
+    variables = {
+        "zoneTag": zone_id,
+        "startDate": start_date,
+        "endDate": end_date
+    }
+    
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json"
+    }
     
     try:
-        res = requests.get(url, headers=headers, timeout=10).json()
-        if not res.get("success"):
-            errors = res.get("errors", [])
-            err_msg = ", ".join([f"{e.get('code')}: {e.get('message')}" for e in errors]) if errors else "Odrzucono zapytanie"
-            return None, f"Cloudflare API: {err_msg}"
+        response = requests.post(
+            "https://api.cloudflare.com/client/v4/graphql",
+            json={"query": query, "variables": variables},
+            headers=headers,
+            timeout=10
+        )
+        res = response.json()
         
-        totals = res["result"]["totals"]
+        if res.get("errors"):
+            err_msg = ", ".join([e.get("message", "Błąd") for e in res["errors"]])
+            return None, None, f"Cloudflare GraphQL: {err_msg}"
+        
+        zones = res.get("data", {}).get("viewer", {}).get("zones", [])
+        if not zones:
+            return None, None, "Nie znaleziono strefy dla podanego Zone ID"
+        
+        groups = zones[0].get("httpRequests1dGroups", [])
+        if not groups:
+            return {
+                "requests": 0,
+                "bandwidth_mb": 0.0,
+                "uniques": 0,
+                "threats": 0,
+            }, [], None
+        
+        total_requests = sum(g.get("sum", {}).get("requests", 0) for g in groups)
+        total_bytes = sum(g.get("sum", {}).get("bytes", 0) for g in groups)
+        total_threats = sum(g.get("sum", {}).get("threats", 0) for g in groups)
+        total_uniques = sum(g.get("uniq", {}).get("uniques", 0) for g in groups)
+        
+        daily_data = [
+            {
+                "Data": g.get("dimensions", {}).get("date"),
+                "Zapytania": g.get("sum", {}).get("requests", 0),
+                "Unikalni goście": g.get("uniq", {}).get("uniques", 0),
+            }
+            for g in groups
+        ]
+        
         return {
-            "requests": totals["requests"]["all"],
-            "bandwidth_mb": round(totals["bandwidth"]["all"] / (1024 * 1024), 2),
-            "uniques": totals["uniques"]["all"],
-            "threats": totals["threats"]["all"],
-        }, None
+            "requests": total_requests,
+            "bandwidth_mb": round(total_bytes / (1024 * 1024), 2),
+            "uniques": total_uniques,
+            "threats": total_threats,
+        }, daily_data, None
     except Exception as e:
-        return None, str(e)
+        return None, None, str(e)
 
 # --- POBIERANIE DANYCH Z GOOGLE ANALYTICS 4 ---
 @st.cache_data(ttl=300)
@@ -158,7 +229,7 @@ def fetch_ga4_data(days=7):
     except Exception as e:
         return None, None, None, str(e)
 
-# --- NAGŁÓWEK DASHBOARDU Z LOGO RUSTEC ---
+# --- NAGŁÓWEK DASHBOARDU ---
 col_head, col_filter = st.columns([3, 1])
 with col_head:
     st.markdown("""
@@ -176,9 +247,8 @@ with col_filter:
     period = st.selectbox("Zakres czasu", ["Ostatnie 24 godziny", "Ostatnie 7 dni", "Ostatnie 30 dni"], index=1)
     days_map = {"Ostatnie 24 godziny": 1, "Ostatnie 7 dni": 7, "Ostatnie 30 dni": 30}
     days = days_map[period]
-    since_minutes = days * 24 * 60
 
-cf_data, cf_err = fetch_cloudflare_data(since_minutes)
+cf_data, cf_daily, cf_err = fetch_cloudflare_data(days)
 ga_summary, ga_sources, ga_devices, ga_err = fetch_ga4_data(days)
 
 # --- SEKCJA CLOUDFLARE ---
@@ -191,6 +261,19 @@ elif cf_data:
     cf2.metric("Wszystkie żądania", cf_data["requests"])
     cf3.metric("Transfer", f"{cf_data['bandwidth_mb']} MB")
     cf4.metric("Zablokowane ataki", cf_data["threats"], delta_color="inverse")
+    
+    if cf_daily and len(cf_daily) > 1:
+        df_cf = pd.DataFrame(cf_daily)
+        fig_cf = px.bar(df_cf, x="Data", y="Zapytania", hover_data=["Unikalni goście"], color_discrete_sequence=["#f97316"])
+        fig_cf.update_layout(
+            margin=dict(t=20, b=10, l=10, r=10),
+            height=260,
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0)',
+            xaxis=dict(showgrid=False),
+            yaxis=dict(gridcolor="#1e293b")
+        )
+        st.plotly_chart(fig_cf, use_container_width=True)
 
 # --- SEKCJA GOOGLE ANALYTICS 4 ---
 st.markdown("### 👥 Google Analytics 4")
@@ -203,7 +286,7 @@ elif ga_summary:
     kpi3.metric("Wyświetlenia stron", ga_summary["pageviews"])
     kpi4.metric("Zaangażowanie", ga_summary["engagement_rate"], help=f"Śr. czas: {ga_summary['avg_duration']}")
 
-# --- WYKRESY ---
+# --- WYKRESY GA4 ---
 st.markdown("---")
 chart_col1, chart_col2 = st.columns(2)
 
