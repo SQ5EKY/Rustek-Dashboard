@@ -11,6 +11,7 @@ from google.analytics.data_v1beta.types import (
     Dimension,
     Metric,
     RunReportRequest,
+    RunRealtimeReportRequest,
     OrderBy,
 )
 from google.oauth2 import service_account
@@ -179,9 +180,41 @@ def check_password():
 if not check_password():
     st.stop()
 
-# --- CLOUDFLARE Z PORÓWNANIEM ---
+# --- POBIERANIE DANYCH NA ŻYWO (REAL-TIME - OSTATNIE 30 MIN) ---
+@st.cache_data(ttl=30)
+def fetch_ga4_realtime():
+    if "gcp_service_account" not in st.secrets or "GA4_PROPERTY_ID" not in st.secrets:
+        return 0, [], None
+    try:
+        sa_info = dict(st.secrets["gcp_service_account"])
+        credentials = service_account.Credentials.from_service_account_info(sa_info)
+        client = BetaAnalyticsDataClient(credentials=credentials)
+        property_id = str(st.secrets["GA4_PROPERTY_ID"]).strip()
+
+        req = RunRealtimeReportRequest(
+            property=f"properties/{property_id}",
+            metrics=[Metric(name="activeUsers")],
+            dimensions=[Dimension(name="city"), Dimension(name="country")],
+        )
+        res = client.run_realtime_report(req)
+
+        total_users = sum(int(r.metric_values[0].value) for r in res.rows) if res.rows else 0
+        active_cities = []
+        for r in res.rows:
+            cname = r.dimension_values[0].value
+            c_country = r.dimension_values[1].value
+            users_count = int(r.metric_values[0].value)
+            if cname and cname != "(not set)":
+                _, flag = get_country_info(c_country)
+                active_cities.append(f"{cname} {flag} ({users_count})")
+
+        return total_users, active_cities, None
+    except Exception as e:
+        return 0, [], str(e)
+
+# --- CLOUDFLARE Z OBSŁUGĄ "DZIŚ" ORAZ OKRESÓW WSTECZ ---
 @st.cache_data(ttl=300)
-def fetch_cloudflare_data(days=7):
+def fetch_cloudflare_data(days=7, is_today=False):
     if "CF_API_TOKEN" not in st.secrets or "CF_ZONE_ID" not in st.secrets:
         return None, None, None, "Brak klucza CF_API_TOKEN lub CF_ZONE_ID"
     
@@ -189,9 +222,14 @@ def fetch_cloudflare_data(days=7):
     zone_id = st.secrets["CF_ZONE_ID"].strip()
     
     now = datetime.utcnow()
-    start_date = (now - timedelta(days=days*2)).strftime("%Y-%m-%d")
-    split_date = (now - timedelta(days=days)).strftime("%Y-%m-%d")
-    end_date = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+    if is_today:
+        start_date = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+        split_date = now.strftime("%Y-%m-%d")
+        end_date = (now + timedelta(days=1)).strftime("%Y-%m-%d")
+    else:
+        start_date = (now - timedelta(days=days*2)).strftime("%Y-%m-%d")
+        split_date = (now - timedelta(days=days)).strftime("%Y-%m-%d")
+        end_date = (now + timedelta(days=1)).strftime("%Y-%m-%d")
     
     query = """
     query CloudflareDailyMetrics($zoneTag: String!, $startDate: Date!, $endDate: Date!) {
@@ -259,7 +297,7 @@ def fetch_cloudflare_data(days=7):
             p_date = pg.get("dimensions", {}).get("date") if pg else ""
             
             comparison_daily.append({
-                "Dzień": f"Dzień {i+1}",
+                "Dzień": f"Dzień {i+1}" if not is_today else "Dzisiaj",
                 "Bieżący okres": cg.get("sum", {}).get("requests", 0) if cg else 0,
                 "Poprzedni okres": pg.get("sum", {}).get("requests", 0) if pg else 0,
                 "Data bieżąca": c_date,
@@ -270,9 +308,9 @@ def fetch_cloudflare_data(days=7):
     except Exception as e:
         return None, None, None, str(e)
 
-# --- GOOGLE ANALYTICS 4 Z MIASTAMI, KRAJAMI I FLAGAMI ---
+# --- GOOGLE ANALYTICS 4 Z OBSŁUGĄ "DZIŚ" ---
 @st.cache_data(ttl=300)
-def fetch_ga4_data(days=7):
+def fetch_ga4_data(days=7, is_today=False):
     if "gcp_service_account" not in st.secrets or "GA4_PROPERTY_ID" not in st.secrets:
         return None, None, None, None, None, "Brak poświadczeń GA4"
     
@@ -282,18 +320,25 @@ def fetch_ga4_data(days=7):
         client = BetaAnalyticsDataClient(credentials=credentials)
         property_id = str(st.secrets["GA4_PROPERTY_ID"]).strip()
 
+        if is_today:
+            curr_range = DateRange(start_date="today", end_date="today")
+            prev_range = DateRange(start_date="yesterday", end_date="yesterday")
+        else:
+            curr_range = DateRange(start_date=f"{days}daysAgo", end_date="today")
+            prev_range = DateRange(start_date=f"{days*2}daysAgo", end_date=f"{days+1}daysAgo")
+
         # 1. Bieżący okres
         curr_res = client.run_report(RunReportRequest(
             property=f"properties/{property_id}",
             metrics=[Metric(name="activeUsers"), Metric(name="sessions"), Metric(name="screenPageViews"), Metric(name="engagementRate")],
-            date_ranges=[DateRange(start_date=f"{days}daysAgo", end_date="today")],
+            date_ranges=[curr_range],
         ))
 
         # 2. Poprzedni okres
         prev_res = client.run_report(RunReportRequest(
             property=f"properties/{property_id}",
             metrics=[Metric(name="activeUsers"), Metric(name="sessions"), Metric(name="screenPageViews"), Metric(name="engagementRate")],
-            date_ranges=[DateRange(start_date=f"{days*2}daysAgo", end_date=f"{days+1}daysAgo")],
+            date_ranges=[prev_range],
         ))
         
         curr_vals = [int(curr_res.rows[0].metric_values[0].value), int(curr_res.rows[0].metric_values[1].value), int(curr_res.rows[0].metric_values[2].value), float(curr_res.rows[0].metric_values[3].value)] if curr_res.rows else [0,0,0,0]
@@ -319,7 +364,7 @@ def fetch_ga4_data(days=7):
             metrics=[Metric(name="activeUsers"), Metric(name="sessions")],
             order_bys=[OrderBy(metric=OrderBy.MetricOrderBy(metric_name="activeUsers"), desc=True)],
             limit=300,
-            date_ranges=[DateRange(start_date=f"{days}daysAgo", end_date="today")],
+            date_ranges=[curr_range],
         )
         cities_res = client.run_report(cities_req)
         
@@ -394,7 +439,7 @@ def fetch_ga4_data(days=7):
             property=f"properties/{property_id}",
             dimensions=[Dimension(name="sessionDefaultChannelGroup")],
             metrics=[Metric(name="sessions")],
-            date_ranges=[DateRange(start_date=f"{days}daysAgo", end_date="today")],
+            date_ranges=[curr_range],
         ))
         sources = [{"Kanał": CHANNEL_TRANSLATION.get(r.dimension_values[0].value, r.dimension_values[0].value), "Sesje": int(r.metric_values[0].value)} for r in sources_res.rows]
 
@@ -403,7 +448,7 @@ def fetch_ga4_data(days=7):
             property=f"properties/{property_id}",
             dimensions=[Dimension(name="deviceCategory")],
             metrics=[Metric(name="sessions")],
-            date_ranges=[DateRange(start_date=f"{days}daysAgo", end_date="today")],
+            date_ranges=[curr_range],
         ))
         devices = [{"Urządzenie": r.dimension_values[0].value, "Sesje": int(r.metric_values[0].value)} for r in devices_res.rows]
 
@@ -426,12 +471,48 @@ with col_head:
     st.caption(f"Synchronizacja: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 with col_filter:
-    period = st.selectbox("Zakres czasu", ["Ostatnie 24 godziny", "Ostatnie 7 dni", "Ostatnie 30 dni"], index=1)
-    days_map = {"Ostatnie 24 godziny": 1, "Ostatnie 7 dni": 7, "Ostatnie 30 dni": 30}
-    days = days_map[period]
+    period = st.selectbox(
+        "Zakres czasu",
+        ["Dzisiaj (vs Wczoraj)", "Ostatnie 24 godziny", "Ostatnie 7 dni", "Ostatnie 30 dni"],
+        index=0
+    )
+    if period == "Dzisiaj (vs Wczoraj)":
+        is_today = True
+        days = 1
+    elif period == "Ostatnie 24 godziny":
+        is_today = False
+        days = 1
+    elif period == "Ostatnie 7 dni":
+        is_today = False
+        days = 7
+    else:
+        is_today = False
+        days = 30
 
-cf_data, cf_deltas, cf_comparison, cf_err = fetch_cloudflare_data(days)
-ga_summary, ga_deltas, ga_cities, ga_sources, ga_devices, ga_err = fetch_ga4_data(days)
+# --- SEKCJA REAL-TIME (WIZYTY NA ŻYWO) ---
+realtime_users, realtime_cities, rt_err = fetch_ga4_realtime()
+
+rt_col1, rt_col2 = st.columns([4, 1])
+with rt_col1:
+    cities_str = f" • Z miast: {', '.join(realtime_cities)}" if realtime_cities else ""
+    st.markdown(f"""
+    <div style="background: linear-gradient(90deg, #064e3b 0%, #022c22 100%); border: 1px solid #059669; border-radius: 12px; padding: 12px 18px; margin-bottom: 15px; display: flex; align-items: center; gap: 12px;">
+        <span style="display: inline-block; width: 12px; height: 12px; background-color: #10b981; border-radius: 50%; box-shadow: 0 0 10px #10b981;"></span>
+        <div>
+            <span style="font-size: 0.75rem; text-transform: uppercase; letter-spacing: 1px; color: #a7f3d0; font-weight: 700;">NA ŻYWO NA STRONIE (OSTATNIE 30 MIN)</span>
+            <div style="font-size: 1.4rem; font-weight: 800; color: #ffffff;">{realtime_users} osób online <span style="font-size: 0.85rem; font-weight: 400; color: #6ee7b7;">{cities_str}</span></div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+with rt_col2:
+    if st.button("🔄 Odśwież na żywo", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+
+# Pobieranie danych historycznych
+cf_data, cf_deltas, cf_comparison, cf_err = fetch_cloudflare_data(days, is_today)
+ga_summary, ga_deltas, ga_cities, ga_sources, ga_devices, ga_err = fetch_ga4_data(days, is_today)
 
 # --- SEKCJA GOOGLE ANALYTICS 4 ---
 st.markdown("### 👥 Użytkownicy i zachowanie (Google Analytics 4)")
@@ -456,9 +537,8 @@ elif cf_data:
     cf4.metric("Zablokowane ataki", cf_data["threats"], delta=cf_deltas.get("threats"), delta_color="inverse")
     
     # --- WYKRES LINIOWY: PORÓWNANIE RUCHU BIEŻĄCY VS POPRZEDNI OKRES ---
-    if cf_comparison and len(cf_comparison) > 1:
+    if cf_comparison and len(cf_comparison) > 1 and not is_today:
         st.markdown("#### 📈 Porównanie ruchu dzień po dniu (Bieżący vs Poprzedni okres)")
-        
         fig_line = go.Figure()
         
         fig_line.add_trace(go.Scatter(
@@ -495,7 +575,7 @@ elif cf_data:
         )
         st.plotly_chart(fig_line, use_container_width=True)
 
-# --- INTERAKTYWNA MAPA Z BŁYSKAWICZNYMI DYMKAMI HOVER (KOMPATYBILNA Z PLOTLY 5 I 6) ---
+# --- INTERAKTYWNA MAPA Z BŁYSKAWICZNYMI DYMKAMI HOVER (PLOTLY 6) ---
 st.markdown("---")
 st.markdown("### 🗺️ Skąd wchodzą goście? (Najedź kursorem lub dotknij punktu)")
 
@@ -506,7 +586,6 @@ if ga_cities:
     if not df_map.empty:
         sizes = [max(13, min(int(u * 2.2), 36)) for u in df_map["Użytkownicy"]]
         
-        # Obsługa nowej wersji Plotly 6 (Scattermap) oraz starszej (Scattermapbox)
         ScatterClass = getattr(go, "Scattermap", getattr(go, "Scattermapbox", None))
         map_key = "map" if hasattr(go, "Scattermap") else "mapbox"
         
