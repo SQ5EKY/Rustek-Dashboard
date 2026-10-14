@@ -139,6 +139,13 @@ st.set_page_config(
 )
 
 st.markdown("""
+<link rel="apple-touch-icon" sizes="180x180" href="https://rustec.pl/assets/logo-sygnet.png">
+<link rel="icon" type="image/png" href="https://rustec.pl/assets/logo-sygnet.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="RUSTEC">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#0f172a">
 <style>
     /* Bezpieczny odstęp od góry, aby pasek Streamlit nigdy nie obcinał logo ani napisów */
     .block-container {
