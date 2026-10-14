@@ -10,8 +10,90 @@ from google.analytics.data_v1beta.types import (
     Dimension,
     Metric,
     RunReportRequest,
+    OrderBy,
 )
 from google.oauth2 import service_account
+
+# --- BAZA WSPÓŁRZĘDNYCH GŁÓWNYCH MIAST (PL + ŚWIAT) ---
+CITY_COORDS = {
+    # Polska
+    "warszawa": (52.2297, 21.0122), "warsaw": (52.2297, 21.0122),
+    "krakow": (50.0647, 19.9450), "kraków": (50.0647, 19.9450),
+    "plock": (52.5463, 19.7065), "płock": (52.5463, 19.7065),
+    "wroclaw": (51.1079, 17.0385), "wrocław": (51.1079, 17.0385),
+    "poznan": (52.4064, 16.9252), "poznań": (52.4064, 16.9252),
+    "gdansk": (54.3520, 18.6466), "gdańsk": (54.3520, 18.6466),
+    "lodz": (51.7592, 19.4560), "łódź": (51.7592, 19.4560),
+    "szczecin": (53.4285, 14.5528),
+    "bydgoszcz": (53.1235, 18.0084),
+    "lublin": (51.2465, 22.5684),
+    "bialystok": (53.1325, 23.1688), "białystok": (53.1325, 23.1688),
+    "katowice": (50.2649, 19.0238),
+    "gdynia": (54.5189, 18.5305),
+    "czestochowa": (50.8118, 19.1203), "częstochowa": (50.8118, 19.1203),
+    "radom": (51.4027, 21.1471),
+    "torun": (53.0138, 18.5984), "toruń": (53.0138, 18.5984),
+    "sosnowiec": (50.2863, 19.1041),
+    "kielce": (50.8661, 20.6286),
+    "rzeszow": (50.0412, 21.9991), "rzeszów": (50.0412, 21.9991),
+    "gliwice": (50.2945, 18.6714),
+    "zabrze": (50.3249, 18.7857),
+    "olsztyn": (53.7784, 20.4801),
+    "bielsko-biala": (49.8225, 19.0444), "bielsko-biała": (49.8225, 19.0444),
+    "bytom": (50.3480, 18.9157),
+    "zielona gora": (51.9356, 15.5062), "zielona góra": (51.9356, 15.5062),
+    "rybnik": (50.1022, 18.5463),
+    "ruda slaska": (50.2574, 18.8559), "ruda śląska": (50.2574, 18.8559),
+    "opole": (50.6751, 17.9213),
+    "tychy": (50.1264, 18.9866),
+    "gorzow wielkopolski": (52.7368, 15.2288), "gorzów wielkopolski": (52.7368, 15.2288),
+    "dabrowa gornicza": (50.3204, 19.1912), "dąbrowa górnicza": (50.3204, 19.1912),
+    "elblag": (54.1522, 19.4088), "elbląg": (54.1522, 19.4088),
+    "walbrzych": (50.7813, 16.2847), "wałbrzych": (50.7813, 16.2847),
+    "wloclawek": (52.6483, 19.0678), "włocławek": (52.6483, 19.0678),
+    "tarnow": (50.0121, 20.9858), "tarnów": (50.0121, 20.9858),
+    "chorzow": (50.2975, 18.9546), "chorzów": (50.2975, 18.9546),
+    "koszalin": (54.1944, 16.1722),
+    "kalisz": (51.7673, 18.0853),
+    "legnica": (51.2070, 16.1552),
+    "grudziadz": (53.4841, 18.7537), "grudziądz": (53.4841, 18.7537),
+    "jaworzno": (50.2052, 19.2748),
+    "slupsk": (54.4641, 17.0285), "słupsk": (54.4641, 17.0285),
+    "jastrzebie-zdroj": (49.9535, 18.5833), "jastrzębie-zdrój": (49.9535, 18.5833),
+    "nowy sacz": (49.6218, 20.6971), "nowy sącz": (49.6218, 20.6971),
+    "jelenia gora": (50.9044, 15.7194), "jelenia góra": (50.9044, 15.7194),
+    "siedlce": (52.1677, 22.2901),
+    "konin": (52.2234, 18.2512),
+    "piotrkow trybunalski": (51.4052, 19.7032), "piotrków trybunalski": (51.4052, 19.7032),
+    "myslowice": (50.2078, 19.1664), "mysłowice": (50.2078, 19.1664),
+    "inowroclaw": (52.7938, 18.2612), "inowrocław": (52.7938, 18.2612),
+    "lubin": (51.3984, 16.2008),
+    "ostrow wielkopolski": (51.6550, 17.8068), "ostrów wielkopolski": (51.6550, 17.8068),
+    "suwalki": (54.1118, 22.9308), "suwałki": (54.1118, 22.9308),
+    "gniezno": (52.5348, 17.5826),
+    "stargard": (53.3386, 15.0449),
+    "glogow": (51.6635, 16.0845), "głogów": (51.6635, 16.0845),
+    "pabianice": (51.6645, 19.3562),
+    "zamosc": (50.7231, 23.2520), "zamość": (50.7231, 23.2520),
+    "leszno": (51.8427, 16.5749),
+    "chelm": (51.1307, 23.4716), "chełm": (51.1307, 23.4716),
+    "lomza": (53.1781, 22.0594), "łomża": (53.1781, 22.0594),
+    "przemysl": (49.7839, 22.7678), "przemyśl": (49.7839, 22.7678),
+    "mielec": (50.2871, 21.4239),
+    "tczew": (54.0924, 18.7777),
+    "pruszow": (52.1679, 20.8122), "pruszków": (52.1679, 20.8122),
+    "ostroleka": (53.0857, 21.5742), "ostrołęka": (53.0857, 21.5742),
+    "piaseczno": (52.0743, 21.0267),
+    "ciechanow": (52.8794, 20.6186), "ciechanów": (52.8794, 20.6186),
+    "sierpc": (52.8550, 19.6738),
+    "gostynin": (52.4287, 19.4627),
+    "kutno": (52.2327, 19.3644),
+    # Europa & Świat
+    "berlin": (52.5200, 13.4050), "london": (51.5074, -0.1278), "londyn": (51.5074, -0.1278),
+    "frankfurt": (50.1109, 8.6821), "vienna": (48.2082, 16.3738), "wiedeń": (48.2082, 16.3738),
+    "prague": (50.0755, 14.4378), "praga": (50.0755, 14.4378),
+    "kyiv": (50.4501, 30.5234), "kijów": (50.4501, 30.5234),
+}
 
 # --- KONFIGURACJA STRONY ---
 st.set_page_config(
@@ -21,7 +103,6 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# Stylizacja
 st.markdown("""
 <style>
     .block-container { padding-top: 1.5rem; padding-bottom: 2rem; }
@@ -168,7 +249,7 @@ def fetch_cloudflare_data(days=7):
 @st.cache_data(ttl=300)
 def fetch_ga4_data(days=7):
     if "gcp_service_account" not in st.secrets or "GA4_PROPERTY_ID" not in st.secrets:
-        return None, None, None, "Brak poświadczeń GA4 w Secrets (podłączymy w kolejnym kroku)"
+        return None, None, None, None, "Brak poświadczeń GA4 w Secrets"
     
     try:
         sa_info = dict(st.secrets["gcp_service_account"])
@@ -176,6 +257,7 @@ def fetch_ga4_data(days=7):
         client = BetaAnalyticsDataClient(credentials=credentials)
         property_id = str(st.secrets["GA4_PROPERTY_ID"]).strip()
 
+        # 1. Główne KPI
         metrics_req = RunReportRequest(
             property=f"properties/{property_id}",
             dimensions=[],
@@ -201,6 +283,35 @@ def fetch_ga4_data(days=7):
                 "avg_duration": f"{int(float(row.metric_values[4].value))}s",
             }
 
+        # 2. MIASTA (Geolokalizacja)
+        cities_req = RunReportRequest(
+            property=f"properties/{property_id}",
+            dimensions=[Dimension(name="city")],
+            metrics=[Metric(name="activeUsers"), Metric(name="sessions")],
+            order_bys=[OrderBy(metric=OrderBy.MetricOrderBy(metric_name="activeUsers"), desc=True)],
+            limit=30,
+            date_ranges=[DateRange(start_date=f"{days}daysAgo", end_date="today")],
+        )
+        cities_res = client.run_report(cities_req)
+        
+        cities = []
+        for r in cities_res.rows:
+            city_name = r.dimension_values[0].value
+            if city_name and city_name != "(not set)":
+                users = int(r.metric_values[0].value)
+                sess = int(r.metric_values[1].value)
+                coords = CITY_COORDS.get(city_name.lower())
+                lat = coords[0] if coords else None
+                lon = coords[1] if coords else None
+                cities.append({
+                    "Miasto": city_name,
+                    "Użytkownicy": users,
+                    "Sesje": sess,
+                    "lat": lat,
+                    "lon": lon
+                })
+
+        # 3. Źródła ruchu
         sources_req = RunReportRequest(
             property=f"properties/{property_id}",
             dimensions=[Dimension(name="sessionDefaultChannelGroup")],
@@ -213,6 +324,7 @@ def fetch_ga4_data(days=7):
             for r in sources_res.rows
         ]
 
+        # 4. Urządzenia
         device_req = RunReportRequest(
             property=f"properties/{property_id}",
             dimensions=[Dimension(name="deviceCategory")],
@@ -225,9 +337,9 @@ def fetch_ga4_data(days=7):
             for r in device_res.rows
         ]
 
-        return summary, sources, devices, None
+        return summary, cities, sources, devices, None
     except Exception as e:
-        return None, None, None, str(e)
+        return None, None, None, None, str(e)
 
 # --- NAGŁÓWEK DASHBOARDU ---
 col_head, col_filter = st.columns([3, 1])
@@ -249,10 +361,10 @@ with col_filter:
     days = days_map[period]
 
 cf_data, cf_daily, cf_err = fetch_cloudflare_data(days)
-ga_summary, ga_sources, ga_devices, ga_err = fetch_ga4_data(days)
+ga_summary, ga_cities, ga_sources, ga_devices, ga_err = fetch_ga4_data(days)
 
 # --- SEKCJA CLOUDFLARE ---
-st.markdown("### 🛡️ Cloudflare")
+st.markdown("### 🛡️ Ruch sieciowy (Cloudflare)")
 if cf_err:
     st.error(f"⚠️ {cf_err}")
 elif cf_data:
@@ -267,7 +379,7 @@ elif cf_data:
         fig_cf = px.bar(df_cf, x="Data", y="Zapytania", hover_data=["Unikalni goście"], color_discrete_sequence=["#f97316"])
         fig_cf.update_layout(
             margin=dict(t=20, b=10, l=10, r=10),
-            height=260,
+            height=240,
             paper_bgcolor='rgba(0,0,0,0)',
             plot_bgcolor='rgba(0,0,0,0)',
             xaxis=dict(showgrid=False),
@@ -276,40 +388,10 @@ elif cf_data:
         st.plotly_chart(fig_cf, use_container_width=True)
 
 # --- SEKCJA GOOGLE ANALYTICS 4 ---
-st.markdown("### 👥 Google Analytics 4")
+st.markdown("### 👥 Użytkownicy i zachowanie (Google Analytics 4)")
 if ga_err:
-    st.info(f"ℹ️ {ga_err}")
+    st.info(f"ℹ️ {ga_err} — podłącz konto Google Analytics, aby odblokować mapę i statystyki miast.")
 elif ga_summary:
     kpi1, kpi2, kpi3, kpi4 = st.columns(4)
     kpi1.metric("Użytkownicy", ga_summary["active_users"])
-    kpi2.metric("Sesje", ga_summary["sessions"])
-    kpi3.metric("Wyświetlenia stron", ga_summary["pageviews"])
-    kpi4.metric("Zaangażowanie", ga_summary["engagement_rate"], help=f"Śr. czas: {ga_summary['avg_duration']}")
-
-# --- WYKRESY GA4 ---
-st.markdown("---")
-chart_col1, chart_col2 = st.columns(2)
-
-with chart_col1:
-    st.markdown("#### 🎯 Główne źródła ruchu")
-    if ga_sources:
-        df_sources = pd.DataFrame(ga_sources)
-        fig1 = px.pie(df_sources, values="Sesje", names="Kanał", hole=0.45, color_discrete_sequence=px.colors.qualitative.Prism)
-        fig1.update_layout(margin=dict(t=10, b=10, l=10, r=10), showlegend=True, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
-        st.plotly_chart(fig1, use_container_width=True)
-    else:
-        st.caption("Wykres pojawi się po podłączeniu GA4.")
-
-with chart_col2:
-    st.markdown("#### 📱 Urządzenia")
-    if ga_devices:
-        df_devices = pd.DataFrame(ga_devices)
-        fig2 = px.bar(df_devices, x="Urządzenie", y="Sesje", color="Urządzenie", color_discrete_sequence=px.colors.qualitative.Safe)
-        fig2.update_layout(margin=dict(t=10, b=10, l=10, r=10), showlegend=False, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
-        st.plotly_chart(fig2, use_container_width=True)
-    else:
-        st.caption("Wykres pojawi się po podłączeniu GA4.")
-
-if st.button("Wyloguj"):
-    st.session_state["authenticated"] = False
-    st.rerun()
+    kpi2.metric("Sesje", ga_
