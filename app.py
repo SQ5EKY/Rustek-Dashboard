@@ -181,26 +181,27 @@ if not check_password():
     st.stop()
 
 # --- POBIERANIE DANYCH NA ŻYWO (REAL-TIME - OSTATNIE 30 MIN) ---
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=15)
 def fetch_ga4_realtime():
     if "gcp_service_account" not in st.secrets or "GA4_PROPERTY_ID" not in st.secrets:
-        return 0, [], None
+        return 0, [], {}, None
     try:
         sa_info = dict(st.secrets["gcp_service_account"])
         credentials = service_account.Credentials.from_service_account_info(sa_info)
         client = BetaAnalyticsDataClient(credentials=credentials)
         property_id = str(st.secrets["GA4_PROPERTY_ID"]).strip()
 
-        req = RunRealtimeReportRequest(
+        # 1. Raport ogólny: aktualnie aktywni oraz miasta
+        req_total = RunRealtimeReportRequest(
             property=f"properties/{property_id}",
             metrics=[Metric(name="activeUsers")],
             dimensions=[Dimension(name="city"), Dimension(name="country")],
         )
-        res = client.run_realtime_report(req)
+        res_total = client.run_realtime_report(req_total)
 
-        total_users = sum(int(r.metric_values[0].value) for r in res.rows) if res.rows else 0
+        total_users = sum(int(r.metric_values[0].value) for r in res_total.rows) if res_total.rows else 0
         active_cities = []
-        for r in res.rows:
+        for r in res_total.rows:
             cname = r.dimension_values[0].value
             c_country = r.dimension_values[1].value
             users_count = int(r.metric_values[0].value)
@@ -208,9 +209,88 @@ def fetch_ga4_realtime():
                 _, flag = get_country_info(c_country)
                 active_cities.append(f"{cname} {flag} ({users_count})")
 
-        return total_users, active_cities, None
+        # 2. Raport minutowy: szczegółowy rozkład co do minuty z miastem i urządzeniem
+        minutes_data = {m: [] for m in range(30)}
+        try:
+            req_min = RunRealtimeReportRequest(
+                property=f"properties/{property_id}",
+                metrics=[Metric(name="activeUsers")],
+                dimensions=[
+                    Dimension(name="minutesAgo"),
+                    Dimension(name="city"),
+                    Dimension(name="country"),
+                    Dimension(name="deviceCategory"),
+                ],
+            )
+            res_min = client.run_realtime_report(req_min)
+            for r in res_min.rows:
+                try:
+                    m_ago = int(r.dimension_values[0].value)
+                except (ValueError, TypeError):
+                    continue
+                cname = r.dimension_values[1].value
+                ccountry = r.dimension_values[2].value
+                device = r.dimension_values[3].value if len(r.dimension_values) > 3 else ""
+                u_cnt = int(r.metric_values[0].value) if r.metric_values else 0
+
+                dev_lower = device.lower()
+                if "mobile" in dev_lower:
+                    dev_label = "📱 Smartfon"
+                elif "desktop" in dev_lower:
+                    dev_label = "💻 Komputer"
+                elif "tablet" in dev_lower:
+                    dev_label = "📟 Tablet"
+                elif device:
+                    dev_label = f"🖥️ {device}"
+                else:
+                    dev_label = ""
+
+                c_trans, flag = get_country_info(ccountry)
+                loc_label = f"{cname} {flag}" if (cname and cname != "(not set)") else f"{c_trans} {flag}"
+
+                if 0 <= m_ago < 30:
+                    minutes_data[m_ago].append({
+                        "location": loc_label,
+                        "device": dev_label,
+                        "users": u_cnt,
+                    })
+        except Exception:
+            # Fallback bez wymiaru deviceCategory
+            try:
+                req_min = RunRealtimeReportRequest(
+                    property=f"properties/{property_id}",
+                    metrics=[Metric(name="activeUsers")],
+                    dimensions=[
+                        Dimension(name="minutesAgo"),
+                        Dimension(name="city"),
+                        Dimension(name="country"),
+                    ],
+                )
+                res_min = client.run_realtime_report(req_min)
+                for r in res_min.rows:
+                    try:
+                        m_ago = int(r.dimension_values[0].value)
+                    except (ValueError, TypeError):
+                        continue
+                    cname = r.dimension_values[1].value
+                    ccountry = r.dimension_values[2].value
+                    u_cnt = int(r.metric_values[0].value) if r.metric_values else 0
+
+                    c_trans, flag = get_country_info(ccountry)
+                    loc_label = f"{cname} {flag}" if (cname and cname != "(not set)") else f"{c_trans} {flag}"
+
+                    if 0 <= m_ago < 30:
+                        minutes_data[m_ago].append({
+                            "location": loc_label,
+                            "device": "",
+                            "users": u_cnt,
+                        })
+            except Exception:
+                pass
+
+        return total_users, active_cities, minutes_data, None
     except Exception as e:
-        return 0, [], str(e)
+        return 0, [], {}, str(e)
 
 # --- CLOUDFLARE Z OBSŁUGĄ "DZIŚ" ORAZ OKRESÓW WSTECZ ---
 @st.cache_data(ttl=300)
@@ -248,224 +328,265 @@ def fetch_cloudflare_data(days=7, is_today=False):
       }
     }
     """
-    
+    url = "https://api.cloudflare.com/client/v4/graphql"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    
+    payload = {"query": query, "variables": {"zoneTag": zone_id, "startDate": start_date, "endDate": end_date}}
+
     try:
-        response = requests.post(
-            "https://api.cloudflare.com/client/v4/graphql",
-            json={"query": query, "variables": {"zoneTag": zone_id, "startDate": start_date, "endDate": end_date}},
-            headers=headers,
-            timeout=10
-        )
-        res = response.json()
-        if res.get("errors"):
-            return None, None, None, f"Cloudflare: {res['errors'][0].get('message')}"
+        r = requests.post(url, headers=headers, json=payload, timeout=12)
+        res = r.json()
+        if "errors" in res and res["errors"]:
+            return None, None, None, f"Błąd Cloudflare: {res['errors'][0].get('message', 'Nieznany błąd')}"
         
         groups = res.get("data", {}).get("viewer", {}).get("zones", [{}])[0].get("httpRequests1dGroups", [])
+        if not groups:
+            return None, None, None, "Brak danych w wybranym okresie."
         
-        curr_groups = [g for g in groups if g.get("dimensions", {}).get("date") >= split_date]
-        prev_groups = [g for g in groups if g.get("dimensions", {}).get("date") < split_date]
+        curr_uniques, curr_reqs, curr_threats, curr_bytes = 0, 0, 0, 0
+        prev_uniques, prev_reqs, prev_threats, prev_bytes = 0, 0, 0, 0
         
-        curr = {
-            "requests": sum(g.get("sum", {}).get("requests", 0) for g in curr_groups),
-            "bandwidth_mb": round(sum(g.get("sum", {}).get("bytes", 0) for g in curr_groups) / (1024 * 1024), 2),
-            "uniques": sum(g.get("uniq", {}).get("uniques", 0) for g in curr_groups),
-            "threats": sum(g.get("sum", {}).get("threats", 0) for g in curr_groups),
-        }
-        prev = {
-            "requests": sum(g.get("sum", {}).get("requests", 0) for g in prev_groups),
-            "bandwidth_mb": round(sum(g.get("sum", {}).get("bytes", 0) for g in prev_groups) / (1024 * 1024), 2),
-            "uniques": sum(g.get("uniq", {}).get("uniques", 0) for g in prev_groups),
-            "threats": sum(g.get("sum", {}).get("threats", 0) for g in prev_groups),
-        }
+        curr_daily = {}
+        prev_daily = {}
         
-        deltas = {
-            "requests": f"{calc_delta(curr['requests'], prev['requests'])} (było: {prev['requests']:,})",
-            "bandwidth": f"{calc_delta(curr['bandwidth_mb'], prev['bandwidth_mb'])} (było: {prev['bandwidth_mb']} MB)",
-            "uniques": f"{calc_delta(curr['uniques'], prev['uniques'])} (było: {prev['uniques']:,})",
-            "threats": f"{calc_delta(curr['threats'], prev['threats'])} (było: {prev['threats']:,})",
-        }
-        
-        comparison_daily = []
-        max_len = max(len(curr_groups), len(prev_groups))
-        for i in range(max_len):
-            cg = curr_groups[i] if i < len(curr_groups) else None
-            pg = prev_groups[i] if i < len(prev_groups) else None
+        for g in groups:
+            d = g["dimensions"]["date"]
+            u = g["uniq"]["uniques"]
+            req = g["sum"]["requests"]
+            thr = g["sum"]["threats"]
+            byt = g["sum"]["bytes"]
             
-            c_date = cg.get("dimensions", {}).get("date") if cg else ""
-            p_date = pg.get("dimensions", {}).get("date") if pg else ""
-            
-            comparison_daily.append({
-                "Dzień": f"Dzień {i+1}" if not is_today else "Dzisiaj",
-                "Bieżący okres": cg.get("sum", {}).get("requests", 0) if cg else 0,
-                "Poprzedni okres": pg.get("sum", {}).get("requests", 0) if pg else 0,
-                "Data bieżąca": c_date,
-                "Data poprzednia": p_date,
-            })
-        
-        return curr, deltas, comparison_daily, None
-    except Exception as e:
-        return None, None, None, str(e)
+            if is_today:
+                if d == split_date:
+                    curr_uniques += u
+                    curr_reqs += req
+                    curr_threats += thr
+                    curr_bytes += byt
+                elif d == start_date:
+                    prev_uniques += u
+                    prev_reqs += req
+                    prev_threats += thr
+                    prev_bytes += byt
+            else:
+                if d >= split_date:
+                    curr_uniques += u
+                    curr_reqs += req
+                    curr_threats += thr
+                    curr_bytes += byt
+                    curr_daily[d] = req
+                else:
+                    prev_uniques += u
+                    prev_reqs += req
+                    prev_threats += thr
+                    prev_bytes += byt
+                    prev_daily[d] = req
 
-# --- GOOGLE ANALYTICS 4 Z OBSŁUGĄ "DZIŚ" ---
+        data = {
+            "uniques": curr_uniques,
+            "requests": curr_reqs,
+            "threats": curr_threats,
+            "bandwidth_mb": round(curr_bytes / (1024 * 1024), 2),
+        }
+        prev_data = {
+            "uniques": prev_uniques,
+            "requests": prev_reqs,
+            "threats": prev_threats,
+            "bandwidth_mb": round(prev_bytes / (1024 * 1024), 2),
+        }
+
+        deltas = {
+            "uniques": f"{calc_delta(data['uniques'], prev_data['uniques'])} (było: {prev_data['uniques']:,})",
+            "requests": f"{calc_delta(data['requests'], prev_data['requests'])} (było: {prev_data['requests']:,})",
+            "threats": f"{calc_delta(data['threats'], prev_data['threats'])} (było: {prev_data['threats']:,})",
+            "bandwidth": f"{calc_delta(data['bandwidth_mb'], prev_data['bandwidth_mb'])} (było: {prev_data['bandwidth_mb']} MB)",
+        }
+        
+        comparison = []
+        if not is_today and curr_daily:
+            curr_sorted_dates = sorted(curr_daily.keys())
+            prev_sorted_dates = sorted(prev_daily.keys())
+            for i, c_date in enumerate(curr_sorted_dates):
+                p_req = prev_daily.get(prev_sorted_dates[i], 0) if i < len(prev_sorted_dates) else 0
+                comparison.append({
+                    "Dzień": f"Dzień {i+1} ({c_date[-5:]})",
+                    "Bieżący okres": curr_daily[c_date],
+                    "Poprzedni okres": p_req
+                })
+
+        return data, deltas, comparison, None
+    except Exception as e:
+        return None, None, None, f"Błąd połączenia z Cloudflare: {str(e)}"
+
+# --- GOOGLE ANALYTICS 4 Z OBSŁUGĄ "DZIŚ" ORAZ PORÓWNANIEM ---
 @st.cache_data(ttl=300)
 def fetch_ga4_data(days=7, is_today=False):
     if "gcp_service_account" not in st.secrets or "GA4_PROPERTY_ID" not in st.secrets:
-        return None, None, None, None, None, "Brak poświadczeń GA4"
-    
+        return None, None, None, None, None, "Brak konfiguracji GA4 w Secrets."
+
     try:
         sa_info = dict(st.secrets["gcp_service_account"])
         credentials = service_account.Credentials.from_service_account_info(sa_info)
         client = BetaAnalyticsDataClient(credentials=credentials)
         property_id = str(st.secrets["GA4_PROPERTY_ID"]).strip()
 
+        # Zakresy dat
         if is_today:
             curr_range = DateRange(start_date="today", end_date="today")
             prev_range = DateRange(start_date="yesterday", end_date="yesterday")
         else:
-            curr_range = DateRange(start_date=f"{days}daysAgo", end_date="today")
+            curr_range = DateRange(start_date=f"{days}daysAgo", end_date="yesterday")
             prev_range = DateRange(start_date=f"{days*2}daysAgo", end_date=f"{days+1}daysAgo")
 
-        # 1. Bieżący okres
-        curr_res = client.run_report(RunReportRequest(
+        # 1. Metryki główne (Summary)
+        req_summary = RunReportRequest(
             property=f"properties/{property_id}",
-            metrics=[Metric(name="activeUsers"), Metric(name="sessions"), Metric(name="screenPageViews"), Metric(name="engagementRate")],
-            date_ranges=[curr_range],
-        ))
-
-        # 2. Poprzedni okres
-        prev_res = client.run_report(RunReportRequest(
-            property=f"properties/{property_id}",
-            metrics=[Metric(name="activeUsers"), Metric(name="sessions"), Metric(name="screenPageViews"), Metric(name="engagementRate")],
-            date_ranges=[prev_range],
-        ))
+            date_ranges=[curr_range, prev_range],
+            metrics=[
+                Metric(name="activeUsers"),
+                Metric(name="sessions"),
+                Metric(name="screenPageViews"),
+                Metric(name="engagementRate"),
+            ],
+        )
+        res_summary = client.run_report(req_summary)
         
-        curr_vals = [int(curr_res.rows[0].metric_values[0].value), int(curr_res.rows[0].metric_values[1].value), int(curr_res.rows[0].metric_values[2].value), float(curr_res.rows[0].metric_values[3].value)] if curr_res.rows else [0,0,0,0]
-        prev_vals = [int(prev_res.rows[0].metric_values[0].value), int(prev_res.rows[0].metric_values[1].value), int(prev_res.rows[0].metric_values[2].value), float(prev_res.rows[0].metric_values[3].value)] if prev_res.rows else [0,0,0,0]
+        curr_vals = [0, 0, 0, 0.0]
+        prev_vals = [0, 0, 0, 0.0]
 
-        summary = {"active_users": curr_vals[0], "sessions": curr_vals[1], "pageviews": curr_vals[2], "engagement_rate": f"{curr_vals[3]*100:.1f}%"}
+        for row in res_summary.rows:
+            d_idx = int(row.dimension_values[0].value) if row.dimension_values else 0
+            vals = [
+                int(row.metric_values[0].value),
+                int(row.metric_values[1].value),
+                int(row.metric_values[2].value),
+                round(float(row.metric_values[3].value) * 100, 1),
+            ]
+            if d_idx == 0:
+                curr_vals = vals
+            else:
+                prev_vals = vals
+
+        summary = {
+            "active_users": curr_vals[0],
+            "sessions": curr_vals[1],
+            "pageviews": curr_vals[2],
+            "engagement_rate": f"{curr_vals[3]}%",
+        }
         deltas = {
             "active_users": f"{calc_delta(curr_vals[0], prev_vals[0])} (było: {prev_vals[0]:,})",
             "sessions": f"{calc_delta(curr_vals[1], prev_vals[1])} (było: {prev_vals[1]:,})",
             "pageviews": f"{calc_delta(curr_vals[2], prev_vals[2])} (było: {prev_vals[2]:,})",
-            "engagement_rate": f"{(curr_vals[3] - prev_vals[3])*100:+.1f} p.p. (było: {prev_vals[3]*100:.1f}%)" if prev_vals[3] else "",
+            "engagement_rate": f"{curr_vals[3] - prev_vals[3]:+.1f}% (było: {prev_vals[3]}%)",
         }
 
-        # 3. MIASTA + KRAJ + DATA + ŹRÓDŁO
-        cities_req = RunReportRequest(
+        # 2. Miasta + Ostatnia wizyta + Źródło
+        active_range = DateRange(start_date="today", end_date="today") if is_today else DateRange(start_date=f"{days}daysAgo", end_date="today")
+        req_cities = RunReportRequest(
             property=f"properties/{property_id}",
+            date_ranges=[active_range],
             dimensions=[
                 Dimension(name="city"),
                 Dimension(name="country"),
                 Dimension(name="date"),
-                Dimension(name="sessionDefaultChannelGroup"),
+                Dimension(name="sessionDefaultChannelGroup")
             ],
             metrics=[Metric(name="activeUsers"), Metric(name="sessions")],
-            order_bys=[OrderBy(metric=OrderBy.MetricOrderBy(metric_name="activeUsers"), desc=True)],
-            limit=300,
-            date_ranges=[curr_range],
+            order_by=[OrderBy(metric=OrderBy.MetricOrderBy(metric_name="activeUsers"), desc=True)],
+            limit=100,
         )
-        cities_res = client.run_report(cities_req)
+        res_cities = client.run_report(req_cities)
         
-        city_groups = {}
-        for r in cities_res.rows:
-            city_name = r.dimension_values[0].value
-            country_raw = r.dimension_values[1].value
-            if not city_name or city_name == "(not set)":
-                continue
+        cities_dict = {}
+        for row in res_cities.rows:
+            city_name = row.dimension_values[0].value
+            country_name = row.dimension_values[1].value
+            date_str = row.dimension_values[2].value
+            ch_raw = row.dimension_values[3].value
+            ch_pl = CHANNEL_TRANSLATION.get(ch_raw, ch_raw)
             
-            date_str = r.dimension_values[2].value
-            channel = r.dimension_values[3].value
-            users = int(r.metric_values[0].value)
-            sess = int(r.metric_values[1].value)
-            
-            country_name, flag = get_country_info(country_raw)
-            city_key = f"{city_name}_{country_name}"
-            
-            if city_key not in city_groups:
-                coords = CITY_COORDS.get(city_name.lower())
-                if not coords and country_raw.lower() in COUNTRY_DEFAULT_COORDS:
-                    coords = COUNTRY_DEFAULT_COORDS[country_raw.lower()]
+            if city_name and city_name != "(not set)":
+                key = (city_name, country_name)
+                users = int(row.metric_values[0].value)
+                sess = int(row.metric_values[1].value)
                 
-                city_groups[city_key] = {
-                    "Miasto": city_name,
-                    "Kraj": country_name,
-                    "Flaga": flag,
-                    "Użytkownicy": 0,
-                    "Sesje": 0,
-                    "latest_date": date_str,
-                    "channels": {},
-                    "latitude": coords[0] if coords else None,
-                    "longitude": coords[1] if coords else None,
-                }
-            
-            city_groups[city_key]["Użytkownicy"] += users
-            city_groups[city_key]["Sesje"] += sess
-            if date_str > city_groups[city_key]["latest_date"]:
-                city_groups[city_key]["latest_date"] = date_str
-            city_groups[city_key]["channels"][channel] = city_groups[city_key]["channels"].get(channel, 0) + sess
+                if key not in cities_dict:
+                    cities_dict[key] = {
+                        "users": 0,
+                        "sessions": 0,
+                        "latest_date": date_str,
+                        "sources": {}
+                    }
+                cities_dict[key]["users"] += users
+                cities_dict[key]["sessions"] += sess
+                if date_str > cities_dict[key]["latest_date"]:
+                    cities_dict[key]["latest_date"] = date_str
+                cities_dict[key]["sources"][ch_pl] = cities_dict[key]["sources"].get(ch_pl, 0) + users
 
-        cities = []
-        for ckey, cdata in city_groups.items():
-            top_channel_raw = max(cdata["channels"], key=cdata["channels"].get) if cdata["channels"] else "Inne"
-            top_channel = CHANNEL_TRANSLATION.get(top_channel_raw, top_channel_raw)
-            formatted_date = format_ga_date(cdata["latest_date"])
+        cities_data = []
+        for (c_name, c_country), c_info in cities_dict.items():
+            c_low = c_name.lower().strip()
+            co_low = c_country.lower().strip()
             
-            hover_html = (
-                f"<b>📍 {cdata['Miasto']}, {cdata['Kraj']} {cdata['Flaga']}</b><br><br>"
-                f"👥 <b>Odwiedzający:</b> {cdata['Użytkownicy']} osób<br>"
-                f"🔄 <b>Liczba wizyt:</b> {cdata['Sesje']} sesji<br>"
-                f"📅 <b>Ostatnia wizyta:</b> {formatted_date}<br>"
-                f"🎯 <b>Główne źródło:</b> {top_channel}"
-            )
+            coords = CITY_COORDS.get(c_low)
+            if not coords:
+                coords = COUNTRY_DEFAULT_COORDS.get(co_low, (52.0, 19.0))
             
-            cities.append({
-                "Miasto": cdata["Miasto"],
-                "Kraj": f"{cdata['Kraj']} {cdata['Flaga']}",
-                "Użytkownicy": cdata["Użytkownicy"],
-                "Sesje": cdata["Sesje"],
-                "Kiedy": formatted_date,
-                "Zrodlo": top_channel,
-                "hover_text": hover_html,
-                "latitude": cdata["latitude"],
-                "longitude": cdata["longitude"],
+            top_src = max(c_info["sources"].items(), key=lambda x: x[1])[0] if c_info["sources"] else "Brak danych"
+            country_trans, country_flag = get_country_info(c_country)
+
+            cities_data.append({
+                "Miasto": c_name,
+                "Państwo": country_trans,
+                "Flaga": country_flag,
+                "Lokalizacja": f"{c_name}, {country_trans} {country_flag}",
+                "Użytkownicy": c_info["users"],
+                "Sesje": c_info["sessions"],
+                "Ostatnia wizyta": format_ga_date(c_info["latest_date"]),
+                "Główne źródło": top_src,
+                "lat": coords[0],
+                "lon": coords[1],
             })
 
-        cities = sorted(cities, key=lambda x: x["Użytkownicy"], reverse=True)
-
-        # 4. Źródła
-        sources_res = client.run_report(RunReportRequest(
+        # 3. Źródła ruchu
+        req_sources = RunReportRequest(
             property=f"properties/{property_id}",
+            date_ranges=[active_range],
             dimensions=[Dimension(name="sessionDefaultChannelGroup")],
             metrics=[Metric(name="sessions")],
-            date_ranges=[curr_range],
-        ))
-        sources = [{"Kanał": CHANNEL_TRANSLATION.get(r.dimension_values[0].value, r.dimension_values[0].value), "Sesje": int(r.metric_values[0].value)} for r in sources_res.rows]
+            order_by=[OrderBy(metric=OrderBy.MetricOrderBy(metric_name="sessions"), desc=True)],
+            limit=5,
+        )
+        res_sources = client.run_report(req_sources)
+        sources_data = [
+            {"Kanał": CHANNEL_TRANSLATION.get(r.dimension_values[0].value, r.dimension_values[0].value), "Sesje": int(r.metric_values[0].value)}
+            for r in res_sources.rows
+        ]
 
-        # 5. Urządzenia
-        devices_res = client.run_report(RunReportRequest(
+        # 4. Urządzenia
+        req_devices = RunReportRequest(
             property=f"properties/{property_id}",
+            date_ranges=[active_range],
             dimensions=[Dimension(name="deviceCategory")],
-            metrics=[Metric(name="sessions")],
-            date_ranges=[curr_range],
-        ))
-        devices = [{"Urządzenie": r.dimension_values[0].value, "Sesje": int(r.metric_values[0].value)} for r in devices_res.rows]
+            metrics=[Metric(name="activeUsers")],
+            order_by=[OrderBy(metric=OrderBy.MetricOrderBy(metric_name="activeUsers"), desc=True)],
+        )
+        res_devices = client.run_report(req_devices)
+        device_trans = {"desktop": "Komputery", "mobile": "Smartfony", "tablet": "Tablety"}
+        devices_data = [
+            {"Urządzenie": device_trans.get(r.dimension_values[0].value.lower(), r.dimension_values[0].value), "Użytkownicy": int(r.metric_values[0].value)}
+            for r in res_devices.rows
+        ]
 
-        return summary, deltas, cities, sources, devices, None
+        return summary, deltas, cities_data, sources_data, devices_data, None
     except Exception as e:
-        return None, None, None, None, None, str(e)
+        return None, None, None, None, None, f"Błąd połączenia z Google Analytics: {str(e)}"
 
-# --- NAGŁÓWEK DASHBOARDU ---
-col_head, col_filter = st.columns([3, 1])
-with col_head:
+# --- GŁÓWNY NAGŁÓWEK I FILTRY ---
+col_logo, col_filter = st.columns([3, 1])
+with col_logo:
     st.markdown("""
-    <div style="display: flex; align-items: center; gap: 14px; margin-bottom: 8px;">
-        <img src="https://rustec.pl/assets/logo-black.png" alt="RUSTEC" style="height: 44px; border-radius: 6px;">
-        <div style="border-left: 2px solid #f97316; padding-left: 12px;">
-            <div style="font-weight: 700; font-size: 1.25rem; color: #f8fafc; line-height: 1.2;">Live Analytics</div>
-            <div style="font-size: 0.78rem; color: #94a3b8;">Cloudflare & Google Analytics 4</div>
-        </div>
+    <div style="display: flex; align-items: center; gap: 15px; margin-bottom: 0.2rem;">
+        <img src="https://rustec.pl/assets/logo-black.png" alt="RUSTEC" style="height: 48px; border-radius: 8px;">
+        <span style="font-size: 1.5rem; font-weight: 700; color: #f8fafc; letter-spacing: -0.5px;">Panel Analityczny</span>
     </div>
     """, unsafe_allow_html=True)
     st.caption(f"Synchronizacja: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -490,13 +611,13 @@ with col_filter:
         days = 30
 
 # --- SEKCJA REAL-TIME (WIZYTY NA ŻYWO) ---
-realtime_users, realtime_cities, rt_err = fetch_ga4_realtime()
+realtime_users, realtime_cities, minutes_data, rt_err = fetch_ga4_realtime()
 
 rt_col1, rt_col2 = st.columns([4, 1])
 with rt_col1:
     cities_str = f" • Z miast: {', '.join(realtime_cities)}" if realtime_cities else ""
     st.markdown(f"""
-    <div style="background: linear-gradient(90deg, #064e3b 0%, #022c22 100%); border: 1px solid #059669; border-radius: 12px; padding: 12px 18px; margin-bottom: 15px; display: flex; align-items: center; gap: 12px;">
+    <div style="background: linear-gradient(90deg, #064e3b 0%, #022c22 100%); border: 1px solid #059669; border-radius: 12px; padding: 12px 18px; margin-bottom: 12px; display: flex; align-items: center; gap: 12px;">
         <span style="display: inline-block; width: 12px; height: 12px; background-color: #10b981; border-radius: 50%; box-shadow: 0 0 10px #10b981;"></span>
         <div>
             <span style="font-size: 0.75rem; text-transform: uppercase; letter-spacing: 1px; color: #a7f3d0; font-weight: 700;">NA ŻYWO NA STRONIE (OSTATNIE 30 MIN)</span>
@@ -509,6 +630,130 @@ with rt_col2:
     if st.button("🔄 Odśwież na żywo", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
+
+# --- WYKRES SŁUPKOWY W CZASIE RZECZYWISTYM (OD 0 DO -60 MIN / -30 MIN) ---
+if not rt_err:
+    rt_hdr1, rt_hdr2 = st.columns([3, 1])
+    with rt_hdr1:
+        st.markdown("""
+        <div style="display: flex; align-items: center; gap: 8px; margin-top: 4px; margin-bottom: 2px;">
+            <span style="font-size: 0.95rem; font-weight: 700; color: #f1f5f9;">⏱️ Aktywność w czasie rzeczywistym (minuta po minucie)</span>
+        </div>
+        """, unsafe_allow_html=True)
+    with rt_hdr2:
+        rt_view = st.selectbox(
+            "Zakres minut",
+            ["Ostatnie 30 minut", "Ostatnie 60 minut"],
+            index=0,
+            label_visibility="collapsed"
+        )
+
+    max_mins = 60 if rt_view == "Ostatnie 60 minut" else 30
+    range_mins = list(range(max_mins - 1, -1, -1))
+
+    x_labels = []
+    y_vals = []
+    y_display = []
+    tooltips = []
+    bar_texts = []
+    bar_colors = []
+    bar_borders = []
+    tick_vals = []
+    tick_texts = []
+
+    for m in range_mins:
+        lbl = "Teraz" if m == 0 else f"-{m}m"
+        x_labels.append(lbl)
+
+        if max_mins == 30:
+            if m % 5 == 0 or m == 29:
+                tick_vals.append(lbl)
+                tick_texts.append(lbl)
+        else:
+            if m % 10 == 0 or m == 59:
+                tick_vals.append(lbl)
+                tick_texts.append(lbl)
+
+        m_desc = "Teraz (ta minuta)" if m == 0 else f"-{m} min temu"
+        items = minutes_data.get(m, []) if (minutes_data and m < 30) else []
+        u_count = sum(it.get("users", 0) for it in items)
+        y_vals.append(u_count)
+
+        if u_count > 0:
+            y_display.append(u_count)
+            bar_texts.append(str(u_count))
+            bar_colors.append("#10b981")
+            bar_borders.append("#34d399")
+
+            lines = []
+            for it in items:
+                dev = it.get("device", "")
+                dev_str = f" ({dev})" if dev else ""
+                lines.append(f"• {it['location']}{dev_str}: <b>{it['users']} os.</b>")
+            details = "<br>".join(lines)
+            tt = f"<b>⏱️ Czas:</b> {m_desc}<br><b>👥 Aktywni:</b> {u_count} os.<br><b>📍 Kto i skąd:</b><br>{details}"
+        else:
+            y_display.append(0.04)
+            bar_texts.append("")
+            bar_colors.append("rgba(255, 255, 255, 0.08)")
+            bar_borders.append("rgba(255, 255, 255, 0.12)")
+            if m < 30:
+                tt = f"<b>⏱️ Czas:</b> {m_desc}<br><b>👥 Brak aktywności (0 os.)</b>"
+            else:
+                tt = f"<b>⏱️ Czas:</b> {m_desc}<br><i>ℹ️ Bufor API GA4 Realtime obejmuje ostatnie 30 minut.<br>Starszy ruch (30-60 min) trafia do raportów ogólnych.</i>"
+        tooltips.append(tt)
+
+    max_y = max(y_vals) if y_vals else 0
+    fig_rt = go.Figure()
+    fig_rt.add_trace(go.Bar(
+        x=x_labels,
+        y=y_display,
+        customdata=tooltips,
+        hovertemplate="%{customdata}<extra></extra>",
+        marker=dict(
+            color=bar_colors,
+            line=dict(color=bar_borders, width=1),
+            cornerradius=4
+        ),
+        text=bar_texts,
+        textposition="outside",
+        textfont=dict(color="#ffffff", size=11, family="Inter, sans-serif"),
+        cliponaxis=False,
+    ))
+
+    fig_rt.update_layout(
+        height=190,
+        margin=dict(l=5, r=5, t=20, b=25),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(15, 23, 42, 0.4)",
+        hovermode="x",
+        xaxis=dict(
+            showgrid=False,
+            zeroline=False,
+            tickfont=dict(color="#94a3b8", size=10),
+            tickmode="array",
+            tickvals=tick_vals,
+            ticktext=tick_texts,
+        ),
+        yaxis=dict(
+            showgrid=True,
+            gridcolor="rgba(255,255,255,0.06)",
+            zeroline=False,
+            tickfont=dict(color="#94a3b8", size=9),
+            dtick=1,
+            rangemode="nonnegative",
+            range=[0, max(max_y + 1.2, 2.5)],
+        ),
+        showlegend=False,
+    )
+
+    st.plotly_chart(fig_rt, use_container_width=True, config={"displayModeBar": False})
+    st.markdown(
+        "<p style='color: #64748b; font-size: 0.78rem; margin-top: -10px; margin-bottom: 22px;'>"
+        "💡 <b>Wskazówka:</b> Najedź kursorem lub dotknij dowolnego słupka, aby zobaczyć dokładne miasto, państwo z flagą oraz urządzenie (komputer/smartfon). Zielone słupki oznaczają wykrytych użytkowników w danej minucie."
+        "</p>",
+        unsafe_allow_html=True
+    )
 
 # Pobieranie danych historycznych
 cf_data, cf_deltas, cf_comparison, cf_err = fetch_cloudflare_data(days, is_today)
@@ -548,8 +793,8 @@ elif cf_data:
             name="Bieżący okres",
             line=dict(color="#f97316", width=3),
             marker=dict(size=7, color="#f97316"),
-            customdata=[d["Data bieżąca"] for d in cf_comparison],
-            hovertemplate="<b>Bieżący: %{y}</b> (%{customdata})<extra></extra>"
+            fill="tozeroy",
+            fillcolor="rgba(249, 115, 22, 0.12)"
         ))
         
         fig_line.add_trace(go.Scatter(
@@ -557,92 +802,107 @@ elif cf_data:
             y=[d["Poprzedni okres"] for d in cf_comparison],
             mode="lines+markers",
             name="Poprzedni okres",
-            line=dict(color="#94a3b8", width=2, dash="dash"),
-            marker=dict(size=5, color="#94a3b8"),
-            customdata=[d["Data poprzednia"] for d in cf_comparison],
-            hovertemplate="<b>Poprzedni: %{y}</b> (%{customdata})<extra></extra>"
+            line=dict(color="#64748b", width=2, dash="dash"),
+            marker=dict(size=5, color="#64748b")
         ))
         
         fig_line.update_layout(
-            margin=dict(t=20, b=10, l=10, r=10),
-            height=280,
-            paper_bgcolor='rgba(0,0,0,0)',
-            plot_bgcolor='rgba(0,0,0,0)',
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
             hovermode="x unified",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(color="#cbd5e1")),
-            xaxis=dict(showgrid=False, color="#94a3b8"),
-            yaxis=dict(gridcolor="#1e293b", color="#94a3b8")
+            xaxis=dict(showgrid=False, zeroline=False, tickfont=dict(color="#94a3b8")),
+            yaxis=dict(showgrid=True, gridcolor="#1e293b", zeroline=False, tickfont=dict(color="#94a3b8")),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1, font=dict(color="#e2e8f0")),
+            margin=dict(l=10, r=10, t=10, b=10),
+            height=280
         )
         st.plotly_chart(fig_line, use_container_width=True)
 
-# --- INTERAKTYWNA MAPA Z BŁYSKAWICZNYMI DYMKAMI HOVER (PLOTLY 6) ---
-st.markdown("---")
-st.markdown("### 🗺️ Skąd wchodzą goście? (Najedź kursorem lub dotknij punktu)")
-
+# --- MAPA INTERAKTYWNA Z ETYKIETAMI I FLAGAMI ---
 if ga_cities:
-    df_all_cities = pd.DataFrame(ga_cities)
-    df_map = df_all_cities.dropna(subset=["latitude", "longitude"])
+    st.markdown("### 🗺️ Skąd przychodzą klienci (Mapa wizyt)")
+    df_cities = pd.DataFrame(ga_cities)
     
-    if not df_map.empty:
-        sizes = [max(13, min(int(u * 2.2), 36)) for u in df_map["Użytkownicy"]]
-        
-        ScatterClass = getattr(go, "Scattermap", getattr(go, "Scattermapbox", None))
-        map_key = "map" if hasattr(go, "Scattermap") else "mapbox"
-        
-        fig_map = go.Figure(ScatterClass(
-            lat=df_map["latitude"],
-            lon=df_map["longitude"],
-            mode="markers",
-            marker=dict(
-                size=sizes,
-                color="#f97316",
-                opacity=0.88,
-            ),
-            text=df_map["hover_text"],
-            hoverinfo="text",
-            hoverlabel=dict(
-                bgcolor="#0f172a",
-                bordercolor="#f97316",
-                font=dict(color="#f8fafc", size=13, family="sans-serif")
-            )
-        ))
-        
-        map_layout_args = {
-            map_key: dict(
-                style="carto-darkmatter",
-                center=dict(lat=52.1, lon=19.4),
-                zoom=5.3,
-            ),
-            "margin": dict(l=0, r=0, t=0, b=0),
-            "height": 380,
-            "paper_bgcolor": "rgba(0,0,0,0)",
-        }
-        fig_map.update_layout(**map_layout_args)
-        st.plotly_chart(fig_map, use_container_width=True)
+    hover_texts = []
+    for _, row in df_cities.iterrows():
+        hover_texts.append(
+            f"<b>📍 {row['Lokalizacja']}</b><br><br>"
+            f"👥 <b>Użytkownicy:</b> {row['Użytkownicy']}<br>"
+            f"🔄 <b>Sesje:</b> {row['Sesje']}<br>"
+            f"📅 <b>Ostatnia wizyta:</b> {row['Ostatnia wizyta']}<br>"
+            f"🚀 <b>Główne źródło:</b> {row['Główne źródło']}"
+        )
+    df_cities["hover_info"] = hover_texts
+
+    ScatterClass = getattr(go, "Scattermap", getattr(go, "Scattermapbox", None))
+    map_key = "map" if hasattr(go, "Scattermap") else "mapbox"
+    style_key = "style" if hasattr(go, "Scattermap") else "style"
+
+    fig_map = go.Figure(ScatterClass(
+        lat=df_cities["lat"],
+        lon=df_cities["lon"],
+        mode="markers",
+        marker=dict(
+            size=df_cities["Użytkownicy"].apply(lambda x: min(max(x * 6 + 10, 14), 45)),
+            color="#f97316",
+            opacity=0.85,
+        ),
+        text=df_cities["hover_info"],
+        hoverinfo="text",
+    ))
     
-    st.markdown("#### 🏆 Szczegółowy ranking miast")
-    st.dataframe(df_all_cities[["Miasto", "Kraj", "Użytkownicy", "Sesje", "Zrodlo", "Kiedy"]], hide_index=True, use_container_width=True)
+    map_layout = {
+        map_key: {
+            style_key: "carto-darkmatter",
+            "center": {"lat": 52.0693, "lon": 19.4803},
+            "zoom": 4.8,
+        },
+        "margin": {"l": 0, "r": 0, "t": 0, "b": 0},
+        "height": 450,
+        "paper_bgcolor": "rgba(0,0,0,0)",
+    }
+    fig_map.update_layout(**map_layout)
+    st.plotly_chart(fig_map, use_container_width=True)
 
-# --- ŹRÓDŁA I URZĄDZENIA ---
-st.markdown("---")
-col_channels, col_devices = st.columns(2)
+# --- WYKRESY SZCZEGÓŁOWE: URZĄDZENIA I ŹRÓDŁA ---
+chart_col1, chart_col2 = st.columns(2)
 
-with col_channels:
-    st.markdown("#### 🎯 Główne źródła ruchu")
+with chart_col1:
     if ga_sources:
-        df_sources = pd.DataFrame(ga_sources)
-        fig1 = px.pie(df_sources, values="Sesje", names="Kanał", hole=0.45, color_discrete_sequence=px.colors.qualitative.Prism)
-        fig1.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=260, showlegend=True, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
-        st.plotly_chart(fig1, use_container_width=True)
+        st.markdown("#### 🔍 Kanały dotarcia")
+        df_src = pd.DataFrame(ga_sources)
+        fig_src = px.bar(
+            df_src,
+            x="Sesje",
+            y="Kanał",
+            orientation="h",
+            color_discrete_sequence=["#f97316"],
+        )
+        fig_src.update_layout(
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            xaxis=dict(showgrid=True, gridcolor="#1e293b", tickfont=dict(color="#94a3b8")),
+            yaxis=dict(showgrid=False, tickfont=dict(color="#94a3b8")),
+            margin=dict(l=10, r=10, t=10, b=10),
+            height=260,
+        )
+        st.plotly_chart(fig_src, use_container_width=True)
 
-with col_devices:
-    st.markdown("#### 📱 Urządzenia (Smartfon vs Komputer)")
+with chart_col2:
     if ga_devices:
-        df_devices = pd.DataFrame(ga_devices)
-        fig2 = px.bar(df_devices, x="Urządzenie", y="Sesje", color="Urządzenie", color_discrete_sequence=px.colors.qualitative.Safe)
-        fig2.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=260, showlegend=False, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
-        st.plotly_chart(fig2, use_container_width=True)
-
-if st.button("Wyloguj"):
-    st.session_state["authenticated"] = False
-    st.rerun()
+        st.markdown("#### 📱 Urządzenia użytkowników")
+        df_dev = pd.DataFrame(ga_devices)
+        fig_dev = px.pie(
+            df_dev,
+            names="Urządzenie",
+            values="Użytkownicy",
+            color_discrete_sequence=["#f97316", "#38bdf8", "#4ade80"],
+            hole=0.45,
+        )
+        fig_dev.update_layout(
+            paper_bgcolor="rgba(0,0,0,0)",
+            legend=dict(font=dict(color="#e2e8f0")),
+            margin=dict(l=10, r=10, t=10, b=10),
+            height=260,
+        )
+        st.plotly_chart(fig_dev, use_container_width=True)
