@@ -336,8 +336,8 @@ def fetch_ga4_data(days=7):
             sess = int(r.metric_values[1].value)
             
             country_name, flag = get_country_info(country_raw)
-            
             city_key = f"{city_name}_{country_name}"
+            
             if city_key not in city_groups:
                 coords = CITY_COORDS.get(city_name.lower())
                 if not coords and country_raw.lower() in COUNTRY_DEFAULT_COORDS:
@@ -495,7 +495,7 @@ elif cf_data:
         )
         st.plotly_chart(fig_line, use_container_width=True)
 
-# --- INTERAKTYWNA MAPA Z DYMKAMI (MIASTO + KRAJ + FLAGA) ---
+# --- INTERAKTYWNA MAPA Z BŁYSKAWICZNYMI DYMKAMI HOVER (KOMPATYBILNA Z PLOTLY 5 I 6) ---
 st.markdown("---")
 st.markdown("### 🗺️ Skąd wchodzą goście? (Najedź kursorem lub dotknij punktu)")
 
@@ -506,11 +506,15 @@ if ga_cities:
     if not df_map.empty:
         sizes = [max(13, min(int(u * 2.2), 36)) for u in df_map["Użytkownicy"]]
         
-        fig_map = go.Figure(go.Scattermapbox(
+        # Obsługa nowej wersji Plotly 6 (Scattermap) oraz starszej (Scattermapbox)
+        ScatterClass = getattr(go, "Scattermap", getattr(go, "Scattermapbox", None))
+        map_key = "map" if hasattr(go, "Scattermap") else "mapbox"
+        
+        fig_map = go.Figure(ScatterClass(
             lat=df_map["latitude"],
             lon=df_map["longitude"],
             mode="markers",
-            marker=go.scattermapbox.Marker(
+            marker=dict(
                 size=sizes,
                 color="#f97316",
                 opacity=0.88,
@@ -524,16 +528,17 @@ if ga_cities:
             )
         ))
         
-        fig_map.update_layout(
-            mapbox=dict(
+        map_layout_args = {
+            map_key: dict(
                 style="carto-darkmatter",
                 center=dict(lat=52.1, lon=19.4),
                 zoom=5.3,
             ),
-            margin=dict(l=0, r=0, t=0, b=0),
-            height=380,
-            paper_bgcolor="rgba(0,0,0,0)",
-        )
+            "margin": dict(l=0, r=0, t=0, b=0),
+            "height": 380,
+            "paper_bgcolor": "rgba(0,0,0,0)",
+        }
+        fig_map.update_layout(**map_layout_args)
         st.plotly_chart(fig_map, use_container_width=True)
     
     st.markdown("#### 🏆 Szczegółowy ranking miast")
