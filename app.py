@@ -23,8 +23,15 @@ def calc_delta(curr, prev):
     pct = ((curr - prev) / prev) * 100
     return f"{pct:+.1f}%"
 
-def format_ga_date(d_str):
-    if len(d_str) == 8:
+def format_ga_datetime(d_str):
+    if not d_str:
+        return ""
+    d_str = str(d_str).strip()
+    if len(d_str) == 12:  # YYYYMMDDHHMM
+        return f"{d_str[6:8]}.{d_str[4:6]}.{d_str[0:4]} {d_str[8:10]}:{d_str[10:12]}"
+    elif len(d_str) == 10:  # YYYYMMDDHH
+        return f"{d_str[6:8]}.{d_str[4:6]}.{d_str[0:4]} {d_str[8:10]}:00"
+    elif len(d_str) == 8:  # YYYYMMDD
         return f"{d_str[6:8]}.{d_str[4:6]}.{d_str[0:4]}"
     return d_str
 
@@ -482,21 +489,38 @@ def fetch_ga4_data(days=7, is_today=False):
             "engagement_rate": f"{(curr_vals[3] - prev_vals[3])*100:+.1f} p.p. (było: {prev_vals[3]*100:.1f}%)" if prev_vals[3] else "",
         }
 
-        # 3. MIASTA + KRAJ + DATA + ŹRÓDŁO
-        cities_req = RunReportRequest(
-            property=f"properties/{property_id}",
-            dimensions=[
-                Dimension(name="city"),
-                Dimension(name="country"),
-                Dimension(name="date"),
-                Dimension(name="sessionDefaultChannelGroup"),
-            ],
-            metrics=[Metric(name="activeUsers"), Metric(name="sessions")],
-            order_bys=[OrderBy(metric=OrderBy.MetricOrderBy(metric_name="activeUsers"), desc=True)],
-            limit=300,
-            date_ranges=[curr_range],
-        )
-        cities_res = client.run_report(cities_req)
+        # 3. MIASTA + KRAJ + DATA I DOKŁADNA GODZINA + ŹRÓDŁO
+        try:
+            cities_req = RunReportRequest(
+                property=f"properties/{property_id}",
+                dimensions=[
+                    Dimension(name="city"),
+                    Dimension(name="country"),
+                    Dimension(name="dateHourMinute"),
+                    Dimension(name="sessionDefaultChannelGroup"),
+                ],
+                metrics=[Metric(name="activeUsers"), Metric(name="sessions")],
+                order_bys=[OrderBy(dimension=OrderBy.DimensionOrderBy(dimension_name="dateHourMinute"), desc=True)],
+                limit=1000,
+                date_ranges=[curr_range],
+            )
+            cities_res = client.run_report(cities_req)
+        except Exception:
+            # Bezpieczny fallback do date w razie problemu z wymiarem
+            cities_req = RunReportRequest(
+                property=f"properties/{property_id}",
+                dimensions=[
+                    Dimension(name="city"),
+                    Dimension(name="country"),
+                    Dimension(name="date"),
+                    Dimension(name="sessionDefaultChannelGroup"),
+                ],
+                metrics=[Metric(name="activeUsers"), Metric(name="sessions")],
+                order_bys=[OrderBy(metric=OrderBy.MetricOrderBy(metric_name="activeUsers"), desc=True)],
+                limit=500,
+                date_ranges=[curr_range],
+            )
+            cities_res = client.run_report(cities_req)
         
         city_groups = {}
         for r in cities_res.rows:
@@ -540,13 +564,13 @@ def fetch_ga4_data(days=7, is_today=False):
         for ckey, cdata in city_groups.items():
             top_channel_raw = max(cdata["channels"], key=cdata["channels"].get) if cdata["channels"] else "Inne"
             top_channel = CHANNEL_TRANSLATION.get(top_channel_raw, top_channel_raw)
-            formatted_date = format_ga_date(cdata["latest_date"])
+            formatted_date = format_ga_datetime(cdata["latest_date"])
             
             hover_html = (
                 f"<b>📍 {cdata['Miasto']}, {cdata['Kraj']} {cdata['Flaga']}</b><br><br>"
                 f"👥 <b>Odwiedzający:</b> {cdata['Użytkownicy']} osób<br>"
                 f"🔄 <b>Liczba wizyt:</b> {cdata['Sesje']} sesji<br>"
-                f"📅 <b>Ostatnia wizyta:</b> {formatted_date}<br>"
+                f"🕒 <b>Ostatnia wizyta:</b> {formatted_date}<br>"
                 f"🎯 <b>Główne źródło:</b> {top_channel}"
             )
             
@@ -875,7 +899,13 @@ if ga_cities:
         st.plotly_chart(fig_map, use_container_width=True)
     
     st.markdown("#### 🏆 Szczegółowy ranking miast")
-    st.dataframe(df_all_cities[["Miasto", "Kraj", "Użytkownicy", "Sesje", "Zrodlo", "Kiedy"]], hide_index=True, use_container_width=True)
+    st.dataframe(
+        df_all_cities[["Miasto", "Kraj", "Użytkownicy", "Sesje", "Zrodlo", "Kiedy"]].rename(
+            columns={"Zrodlo": "Źródło", "Kiedy": "Ostatnia wizyta"}
+        ),
+        hide_index=True,
+        use_container_width=True,
+    )
 
 # --- ŹRÓDŁA I URZĄDZENIA ---
 st.markdown("---")
