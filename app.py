@@ -394,4 +394,73 @@ if ga_err:
 elif ga_summary:
     kpi1, kpi2, kpi3, kpi4 = st.columns(4)
     kpi1.metric("Użytkownicy", ga_summary["active_users"])
-    kpi2.metric("Sesje", ga_
+    kpi2.metric("Sesje", ga_summary["sessions"])
+    kpi3.metric("Odsłony stron", ga_summary["pageviews"])
+    kpi4.metric("Zaangażowanie", ga_summary["engagement_rate"], help=f"Śr. czas: {ga_summary['avg_duration']}")
+
+# --- INTERAKTYWNA MAPA ODWIEDZAJĄCYCH (MIASTA) ---
+st.markdown("---")
+st.markdown("### 🗺️ Skąd wchodzą goście? (Mapa miast)")
+
+if ga_cities:
+    df_all_cities = pd.DataFrame(ga_cities)
+    df_map = df_all_cities.dropna(subset=["lat", "lon"])
+    
+    if not df_map.empty:
+        fig_map = px.scatter_mapbox(
+            df_map,
+            lat="lat",
+            lon="lon",
+            hover_name="Miasto",
+            hover_data={"Użytkownicy": True, "Sesje": True, "lat": False, "lon": False},
+            size="Użytkownicy",
+            size_max=28,
+            color="Użytkownicy",
+            color_continuous_scale="Oranges",
+            zoom=5.3,
+            center={"lat": 52.1, "lon": 19.4},
+            mapbox_style="carto-darkmatter"
+        )
+        fig_map.update_layout(
+            margin=dict(t=0, b=0, l=0, r=0),
+            height=380,
+            paper_bgcolor='rgba(0,0,0,0)',
+            coloraxis_showscale=False
+        )
+        st.plotly_chart(fig_map, use_container_width=True)
+    
+    # Tabela z miastami
+    col_t1, col_t2 = st.columns([1, 1])
+    with col_t1:
+        st.markdown("#### 🏆 Ranking miast")
+        st.dataframe(df_all_cities[["Miasto", "Użytkownicy", "Sesje"]], hide_index=True, use_container_width=True)
+else:
+    st.caption("Mapa aktywuje się po podłączeniu GA4.")
+
+# --- ŹRÓDŁA I URZĄDZENIA ---
+st.markdown("---")
+col_channels, col_devices = st.columns(2)
+
+with col_channels:
+    st.markdown("#### 🎯 Główne źródła ruchu")
+    if ga_sources:
+        df_sources = pd.DataFrame(ga_sources)
+        fig1 = px.pie(df_sources, values="Sesje", names="Kanał", hole=0.45, color_discrete_sequence=px.colors.qualitative.Prism)
+        fig1.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=260, showlegend=True, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
+        st.plotly_chart(fig1, use_container_width=True)
+    else:
+        st.caption("Wykres źródeł pojawi się po podłączeniu GA4.")
+
+with col_devices:
+    st.markdown("#### 📱 Urządzenia (Smartfon vs Komputer)")
+    if ga_devices:
+        df_devices = pd.DataFrame(ga_devices)
+        fig2 = px.bar(df_devices, x="Urządzenie", y="Sesje", color="Urządzenie", color_discrete_sequence=px.colors.qualitative.Safe)
+        fig2.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=260, showlegend=False, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
+        st.plotly_chart(fig2, use_container_width=True)
+    else:
+        st.caption("Wykres urządzeń pojawi się po podłączeniu GA4.")
+
+if st.button("Wyloguj"):
+    st.session_state["authenticated"] = False
+    st.rerun()
