@@ -81,14 +81,14 @@ CITY_COORDS = {
     "przemysl": (49.7839, 22.7678), "przemyśl": (49.7839, 22.7678),
     "mielec": (50.2871, 21.4239),
     "tczew": (54.0924, 18.7777),
-    "pruszow": (52.1679, 20.8122), "pruszków": (52.1679, 20.8122),
+    "pruszkow": (52.1679, 20.8122), "pruszków": (52.1679, 20.8122),
     "ostroleka": (53.0857, 21.5742), "ostrołęka": (53.0857, 21.5742),
     "piaseczno": (52.0743, 21.0267),
     "ciechanow": (52.8794, 20.6186), "ciechanów": (52.8794, 20.6186),
     "sierpc": (52.8550, 19.6738),
     "gostynin": (52.4287, 19.4627),
     "kutno": (52.2327, 19.3644),
-    # Europa & Świat
+    "lowicz": (52.1069, 19.9469), "łowicz": (52.1069, 19.9469),
     "berlin": (52.5200, 13.4050), "london": (51.5074, -0.1278), "londyn": (51.5074, -0.1278),
     "frankfurt": (50.1109, 8.6821), "vienna": (48.2082, 16.3738), "wiedeń": (48.2082, 16.3738),
     "prague": (50.0755, 14.4378), "praga": (50.0755, 14.4378),
@@ -115,7 +115,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- SYSTEM LOGOWANIA Z LOGO RUSTEC ---
+# --- SYSTEM LOGOWANIA ---
 def check_password():
     if "authenticated" not in st.session_state:
         st.session_state["authenticated"] = False
@@ -145,7 +145,7 @@ def check_password():
 if not check_password():
     st.stop()
 
-# --- POBIERANIE DANYCH Z CLOUDFLARE (GraphQL API) ---
+# --- CLOUDFLARE (GraphQL API) ---
 @st.cache_data(ttl=300)
 def fetch_cloudflare_data(days=7):
     if "CF_API_TOKEN" not in st.secrets or "CF_ZONE_ID" not in st.secrets:
@@ -215,12 +215,7 @@ def fetch_cloudflare_data(days=7):
         
         groups = zones[0].get("httpRequests1dGroups", [])
         if not groups:
-            return {
-                "requests": 0,
-                "bandwidth_mb": 0.0,
-                "uniques": 0,
-                "threats": 0,
-            }, [], None
+            return {"requests": 0, "bandwidth_mb": 0.0, "uniques": 0, "threats": 0}, [], None
         
         total_requests = sum(g.get("sum", {}).get("requests", 0) for g in groups)
         total_bytes = sum(g.get("sum", {}).get("bytes", 0) for g in groups)
@@ -245,7 +240,7 @@ def fetch_cloudflare_data(days=7):
     except Exception as e:
         return None, None, str(e)
 
-# --- POBIERANIE DANYCH Z GOOGLE ANALYTICS 4 ---
+# --- GOOGLE ANALYTICS 4 ---
 @st.cache_data(ttl=300)
 def fetch_ga4_data(days=7):
     if "gcp_service_account" not in st.secrets or "GA4_PROPERTY_ID" not in st.secrets:
@@ -283,13 +278,13 @@ def fetch_ga4_data(days=7):
                 "avg_duration": f"{int(float(row.metric_values[4].value))}s",
             }
 
-        # 2. MIASTA (Geolokalizacja)
+        # 2. MIASTA
         cities_req = RunReportRequest(
             property=f"properties/{property_id}",
             dimensions=[Dimension(name="city")],
             metrics=[Metric(name="activeUsers"), Metric(name="sessions")],
             order_bys=[OrderBy(metric=OrderBy.MetricOrderBy(metric_name="activeUsers"), desc=True)],
-            limit=30,
+            limit=40,
             date_ranges=[DateRange(start_date=f"{days}daysAgo", end_date="today")],
         )
         cities_res = client.run_report(cities_req)
@@ -307,8 +302,8 @@ def fetch_ga4_data(days=7):
                     "Miasto": city_name,
                     "Użytkownicy": users,
                     "Sesje": sess,
-                    "lat": lat,
-                    "lon": lon
+                    "latitude": lat,
+                    "longitude": lon
                 })
 
         # 3. Źródła ruchu
@@ -390,7 +385,7 @@ elif cf_data:
 # --- SEKCJA GOOGLE ANALYTICS 4 ---
 st.markdown("### 👥 Użytkownicy i zachowanie (Google Analytics 4)")
 if ga_err:
-    st.info(f"ℹ️ {ga_err} — podłącz konto Google Analytics, aby odblokować mapę i statystyki miast.")
+    st.info(f"ℹ️ {ga_err}")
 elif ga_summary:
     kpi1, kpi2, kpi3, kpi4 = st.columns(4)
     kpi1.metric("Użytkownicy", ga_summary["active_users"])
@@ -398,44 +393,49 @@ elif ga_summary:
     kpi3.metric("Odsłony stron", ga_summary["pageviews"])
     kpi4.metric("Zaangażowanie", ga_summary["engagement_rate"], help=f"Śr. czas: {ga_summary['avg_duration']}")
 
-# --- INTERAKTYWNA MAPA ODWIEDZAJĄCYCH (MIASTA) ---
+# --- MAPA I RANKING MIAST ---
 st.markdown("---")
 st.markdown("### 🗺️ Skąd wchodzą goście? (Mapa miast)")
 
 if ga_cities:
     df_all_cities = pd.DataFrame(ga_cities)
-    df_map = df_all_cities.dropna(subset=["lat", "lon"])
+    df_map = df_all_cities.dropna(subset=["latitude", "longitude"])
     
     if not df_map.empty:
-        fig_map = px.scatter_mapbox(
+        # Płynna mapa dostosowana do urządzeń mobilnych
+        st.map(
             df_map,
-            lat="lat",
-            lon="lon",
-            hover_name="Miasto",
-            hover_data={"Użytkownicy": True, "Sesje": True, "lat": False, "lon": False},
+            latitude="latitude",
+            longitude="longitude",
             size="Użytkownicy",
-            size_max=28,
-            color="Użytkownicy",
-            color_continuous_scale="Oranges",
-            zoom=5.3,
-            center={"lat": 52.1, "lon": 19.4},
-            mapbox_style="carto-darkmatter"
+            color="#f97316",
+            zoom=5.2
         )
-        fig_map.update_layout(
-            margin=dict(t=0, b=0, l=0, r=0),
-            height=380,
-            paper_bgcolor='rgba(0,0,0,0)',
-            coloraxis_showscale=False
-        )
-        st.plotly_chart(fig_map, use_container_width=True)
     
-    # Tabela z miastami
+    # Tabela i wykres rankingowy miast
     col_t1, col_t2 = st.columns([1, 1])
     with col_t1:
-        st.markdown("#### 🏆 Ranking miast")
+        st.markdown("#### 🏆 Ranking miast (Top)")
         st.dataframe(df_all_cities[["Miasto", "Użytkownicy", "Sesje"]], hide_index=True, use_container_width=True)
-else:
-    st.caption("Mapa aktywuje się po podłączeniu GA4.")
+    with col_t2:
+        top_cities = df_all_cities.head(8)
+        fig_city = px.bar(
+            top_cities,
+            x="Użytkownicy",
+            y="Miasto",
+            orientation="h",
+            color_discrete_sequence=["#f97316"],
+        )
+        fig_city.update_layout(
+            yaxis=dict(autorange="reversed"),
+            margin=dict(t=10, b=10, l=10, r=10),
+            height=260,
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0)',
+            xaxis=dict(showgrid=False),
+            yaxis_title=None
+        )
+        st.plotly_chart(fig_city, use_container_width=True)
 
 # --- ŹRÓDŁA I URZĄDZENIA ---
 st.markdown("---")
@@ -448,8 +448,6 @@ with col_channels:
         fig1 = px.pie(df_sources, values="Sesje", names="Kanał", hole=0.45, color_discrete_sequence=px.colors.qualitative.Prism)
         fig1.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=260, showlegend=True, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
         st.plotly_chart(fig1, use_container_width=True)
-    else:
-        st.caption("Wykres źródeł pojawi się po podłączeniu GA4.")
 
 with col_devices:
     st.markdown("#### 📱 Urządzenia (Smartfon vs Komputer)")
@@ -458,8 +456,6 @@ with col_devices:
         fig2 = px.bar(df_devices, x="Urządzenie", y="Sesje", color="Urządzenie", color_discrete_sequence=px.colors.qualitative.Safe)
         fig2.update_layout(margin=dict(t=10, b=10, l=10, r=10), height=260, showlegend=False, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
         st.plotly_chart(fig2, use_container_width=True)
-    else:
-        st.caption("Wykres urządzeń pojawi się po podłączeniu GA4.")
 
 if st.button("Wyloguj"):
     st.session_state["authenticated"] = False
