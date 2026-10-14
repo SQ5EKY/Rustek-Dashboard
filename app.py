@@ -140,7 +140,19 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-    .block-container { padding-top: 1.5rem; padding-bottom: 2rem; }
+    /* Bezpieczny odstęp od góry, aby pasek Streamlit nigdy nie obcinał logo ani napisów */
+    .block-container {
+        padding-top: 4.8rem !important;
+        padding-bottom: 2.5rem !important;
+    }
+    @media (max-width: 768px) {
+        .block-container {
+            padding-top: 5.2rem !important;
+        }
+    }
+    header[data-testid="stHeader"] {
+        background: transparent !important;
+    }
     div[data-testid="metric-container"] {
         background-color: #0f172a;
         border: 1px solid #1e293b;
@@ -567,13 +579,16 @@ def fetch_ga4_data(days=7, is_today=False):
     except Exception as e:
         return None, None, None, None, None, str(e)
 
-# --- GŁÓWNY NAGŁÓWEK I FILTRY ---
-col_logo, col_filter = st.columns([3, 1])
-with col_logo:
+# --- NAGŁÓWEK DASHBOARDU ---
+col_head, col_filter = st.columns([3, 1])
+with col_head:
     st.markdown("""
-    <div style="display: flex; align-items: center; gap: 15px; margin-bottom: 0.2rem;">
-        <img src="https://rustec.pl/assets/logo-black.png" alt="RUSTEC" style="height: 48px; border-radius: 8px;">
-        <span style="font-size: 1.5rem; font-weight: 700; color: #f8fafc; letter-spacing: -0.5px;">Panel Analityczny</span>
+    <div style="display: flex; align-items: center; gap: 14px; margin-bottom: 8px;">
+        <img src="https://rustec.pl/assets/logo-black.png" alt="RUSTEC" style="height: 44px; border-radius: 6px;">
+        <div style="border-left: 2px solid #f97316; padding-left: 12px;">
+            <div style="font-weight: 700; font-size: 1.25rem; color: #f8fafc; line-height: 1.2;">Live Analytics</div>
+            <div style="font-size: 0.78rem; color: #94a3b8;">Cloudflare & Google Analytics 4</div>
+        </div>
     </div>
     """, unsafe_allow_html=True)
     st.caption(f"Synchronizacja: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
